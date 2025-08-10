@@ -3,6 +3,7 @@
 // - Keeps public wrapper applyTransposition(key[8]) which expands to 16 bytes.
 // - applyTranspositionEnhanced(data, grid, key16, mode) is the worker.
 // - Uses dynamic buffers and robust bounds checks.
+// - Permutes blocks only within groups of identical (rows,cols) to ensure invertibility.
 
 #include "transposition.h"
 #include <string.h>
@@ -14,17 +15,14 @@
 struct KeyedPRNG {
   uint64_t s;
   KeyedPRNG(const uint8_t key16[16]) {
-    // Combine key bytes into a 64-bit seed deterministically.
     uint64_t a = 0, b = 0;
     if (key16) {
       for (int i = 0; i < 8; ++i) a = (a << 8) | (uint64_t)key16[i];
       for (int i = 0; i < 8; ++i) b = (b << 8) | (uint64_t)key16[8 + i];
     }
-    // Mix them; avoid zero state.
     s = a ^ ((b << 1) | (b >> 63)) ^ 0x9E3779B97F4A7C15ULL;
     if (s == 0) s = 0xDEADBEEFC0FFEEULL;
   }
-  // splitmix64 next
   uint64_t next64() {
     uint64_t z = (s += 0x9E3779B97F4A7C15ULL);
     z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
@@ -35,38 +33,34 @@ struct KeyedPRNG {
   uint8_t nextByte() { return (uint8_t)(next32() & 0xFFu); }
 };
 
-// Utility rotate (not used now but left if needed)
-static inline uint32_t rotl32(uint32_t x, int r) { return (x << r) | (x >> (32 - r)); }
+// Block dimension structure to ensure consistency
+struct BlockDim {
+  size_t rows, cols;
+  size_t r0, r1, c0, c1;  // actual coordinates in grid
+};
 
-// Helper: read block (r0..r1-1, c0..c1-1) into tmpBuf (row-major)
-static void readBlock(const uint8_t *data, const GridSpec &g,
-                      size_t r0, size_t r1, size_t c0, size_t c1,
-                      uint8_t *tmpBuf)
-{
+// Helper: read block into tmpBuf (row-major)
+static void readBlock(const uint8_t *data, const GridSpec &g, const BlockDim &block, uint8_t *tmpBuf) {
   size_t idx = 0;
-  for (size_t r = r0; r < r1; ++r) {
-    for (size_t c = c0; c < c1; ++c) {
+  for (size_t r = block.r0; r < block.r1; ++r) {
+    for (size_t c = block.c0; c < block.c1; ++c) {
       tmpBuf[idx++] = data[r * g.cols + c];
     }
   }
 }
 
-// Helper: writeBlock from tmpBuf back into data
-static void writeBlock(uint8_t *data, const GridSpec &g,
-                       size_t r0, size_t r1, size_t c0, size_t c1,
-                       const uint8_t *tmpBuf)
-{
+// Helper: write block from tmpBuf back into data
+static void writeBlock(uint8_t *data, const GridSpec &g, const BlockDim &block, const uint8_t *tmpBuf) {
   size_t idx = 0;
-  for (size_t r = r0; r < r1; ++r) {
-    for (size_t c = c0; c < c1; ++c) {
+  for (size_t r = block.r0; r < block.r1; ++r) {
+    for (size_t c = block.c0; c < block.c1; ++c) {
       data[r * g.cols + c] = tmpBuf[idx++];
     }
   }
 }
 
 // In-place row rotate in a block: shift row by offset mod width
-static void rotateRowInBlock(uint8_t *block, size_t blockCols, size_t rowIndex, int offset)
-{
+static void rotateRowInBlock(uint8_t *block, size_t blockCols, size_t rowIndex, int offset) {
   if (blockCols == 0) return;
   offset = ((offset % (int)blockCols) + (int)blockCols) % (int)blockCols;
   if (offset == 0) return;
@@ -80,8 +74,7 @@ static void rotateRowInBlock(uint8_t *block, size_t blockCols, size_t rowIndex, 
 }
 
 // In-place column rotate in a block
-static void rotateColInBlock(uint8_t *block, size_t blockCols, size_t blockRows, size_t colIndex, int offset)
-{
+static void rotateColInBlock(uint8_t *block, size_t blockCols, size_t blockRows, size_t colIndex, int offset) {
   if (blockRows == 0) return;
   offset = ((offset % (int)blockRows) + (int)blockRows) % (int)blockRows;
   if (offset == 0) return;
@@ -93,8 +86,7 @@ static void rotateColInBlock(uint8_t *block, size_t blockCols, size_t blockRows,
 }
 
 // Fisher-Yates shuffle of array 'arr' of length n using KeyedPRNG
-static void fy_shuffle_uint16(uint16_t *arr, size_t n, KeyedPRNG &prng)
-{
+static void fy_shuffle_uint16(uint16_t *arr, size_t n, KeyedPRNG &prng) {
   if (n <= 1) return;
   for (size_t i = n - 1; i > 0; --i) {
     uint32_t rnd32 = prng.next32();
@@ -105,9 +97,8 @@ static void fy_shuffle_uint16(uint16_t *arr, size_t n, KeyedPRNG &prng)
   }
 }
 
-// Main enhanced transposition
-void applyTranspositionEnhanced(uint8_t *data, const GridSpec &grid, const uint8_t key[16], PermuteMode mode)
-{
+// Main enhanced transposition - completely deterministic, group-based
+void applyTranspositionEnhanced(uint8_t *data, const GridSpec &grid, const uint8_t key[16], PermuteMode mode) {
   if (!data || grid.rows == 0 || grid.cols == 0) return;
 
   // Determine block size heuristically from key (1..4)
@@ -123,43 +114,118 @@ void applyTranspositionEnhanced(uint8_t *data, const GridSpec &grid, const uint8
   size_t totalBlocks = br * bc;
   if (totalBlocks == 0) return;
 
-  // Keyed deterministic PRNG
   KeyedPRNG prng(key);
 
-  // Build block index array
-  uint16_t *blockIdx = (uint16_t*)malloc(sizeof(uint16_t) * totalBlocks);
-  if (!blockIdx) return;
-  for (uint16_t i = 0; i < (uint16_t)totalBlocks; ++i) blockIdx[i] = i;
-
-  // Permute blockIdx deterministically
-  fy_shuffle_uint16(blockIdx, totalBlocks, prng);
-
-  // If decrypt mode, build inverse map
-  uint16_t *invBlockIdx = NULL;
-  if (mode == PermuteMode::Inverse) {
-    invBlockIdx = (uint16_t*)malloc(sizeof(uint16_t) * totalBlocks);
-    if (!invBlockIdx) { free(blockIdx); return; }
-    // initialize (not strictly necessary but safe)
-    for (size_t i = 0; i < totalBlocks; ++i) invBlockIdx[i] = 0xFFFF;
-    for (size_t i = 0; i < totalBlocks; ++i) invBlockIdx[blockIdx[i]] = (uint16_t)i;
+  // Pre-calc block dims for every original block index
+  BlockDim *blockDims = (BlockDim*)malloc(sizeof(BlockDim) * totalBlocks);
+  if (!blockDims) return;
+  for (size_t b = 0; b < totalBlocks; ++b) {
+    size_t brIdx = b / bc;
+    size_t bcIdx = b % bc;
+    blockDims[b].r0 = brIdx * blockH;
+    blockDims[b].c0 = bcIdx * blockW;
+    blockDims[b].r1 = (blockDims[b].r0 + blockH) > grid.rows ? grid.rows : (blockDims[b].r0 + blockH);
+    blockDims[b].c1 = (blockDims[b].c0 + blockW) > grid.cols ? grid.cols : (blockDims[b].c0 + blockW);
+    blockDims[b].rows = blockDims[b].r1 - blockDims[b].r0;
+    blockDims[b].cols = blockDims[b].c1 - blockDims[b].c0;
   }
 
-  // temp buffer for one block (largest possible)
-  size_t maxBlockRows = blockH;
-  size_t maxBlockCols = blockW;
-  size_t maxBlockBytes = (maxBlockRows == 0 || maxBlockCols == 0) ? 1 : (maxBlockRows * maxBlockCols);
-  uint8_t *tmpBuf = (uint8_t*)malloc(maxBlockBytes);
-  if (!tmpBuf) { free(blockIdx); if (invBlockIdx) free(invBlockIdx); return; }
+  // Group blocks by (rows,cols) so we only permute within identical shapes (ensures invertibility)
+  int *groupId = (int*)malloc(sizeof(int) * totalBlocks);
+  if (!groupId) { free(blockDims); return; }
+  for (size_t i = 0; i < totalBlocks; ++i) groupId[i] = -1;
 
-  // Operation generation per block
-  struct BlockOp { uint8_t type; uint8_t p1; int8_t p2; }; // type: 0=rowSwap,1=colSwap,2=rowRev,3=colRev,4=rowRot,5=colRot, 0xFF terminator
+  // store unique pairs
+  size_t *grows = (size_t*)malloc(sizeof(size_t) * totalBlocks);
+  size_t *gcols = (size_t*)malloc(sizeof(size_t) * totalBlocks);
+  if (!grows || !gcols) { free(blockDims); free(groupId); free(grows); free(gcols); return; }
+  size_t uniqueCount = 0;
+
+  for (size_t b = 0; b < totalBlocks; ++b) {
+    size_t rr = blockDims[b].rows;
+    size_t cc = blockDims[b].cols;
+    size_t k;
+    for (k = 0; k < uniqueCount; ++k) {
+      if (grows[k] == rr && gcols[k] == cc) {
+        groupId[b] = (int)k;
+        break;
+      }
+    }
+    if (k == uniqueCount) {
+      // new group
+      grows[uniqueCount] = rr;
+      gcols[uniqueCount] = cc;
+      groupId[b] = (int)uniqueCount;
+      uniqueCount++;
+    }
+  }
+
+  // count group sizes
+  size_t *groupCounts = (size_t*)calloc(uniqueCount, sizeof(size_t));
+  if (!groupCounts) { free(blockDims); free(groupId); free(grows); free(gcols); return; }
+  for (size_t b = 0; b < totalBlocks; ++b) groupCounts[groupId[b]]++;
+
+  // prefix offsets and members list
+  size_t *groupOffsets = (size_t*)malloc(sizeof(size_t) * (uniqueCount + 1));
+  if (!groupOffsets) { free(blockDims); free(groupId); free(grows); free(gcols); free(groupCounts); return; }
+  groupOffsets[0] = 0;
+  for (size_t k = 0; k < uniqueCount; ++k) groupOffsets[k + 1] = groupOffsets[k] + groupCounts[k];
+
+  uint16_t *members = (uint16_t*)malloc(sizeof(uint16_t) * totalBlocks);
+  if (!members) { free(blockDims); free(groupId); free(grows); free(gcols); free(groupCounts); free(groupOffsets); return; }
+
+  // temp cursor to fill members
+  size_t *fillCursor = (size_t*)malloc(sizeof(size_t) * uniqueCount);
+  if (!fillCursor) { free(blockDims); free(groupId); free(grows); free(gcols); free(groupCounts); free(groupOffsets); free(members); return; }
+  for (size_t k = 0; k < uniqueCount; ++k) fillCursor[k] = groupOffsets[k];
+
+  for (size_t b = 0; b < totalBlocks; ++b) {
+    int gid = groupId[b];
+    members[fillCursor[gid]++] = (uint16_t)b;
+  }
+
+  // Build blockIdx mapping (destination index -> source index), but only permute inside each group
+  uint16_t *blockIdx = (uint16_t*)malloc(sizeof(uint16_t) * totalBlocks);
+  if (!blockIdx) { free(blockDims); free(groupId); free(grows); free(gcols); free(groupCounts); free(groupOffsets); free(members); free(fillCursor); return; }
+
+  for (size_t k = 0; k < uniqueCount; ++k) {
+    size_t start = groupOffsets[k];
+    size_t cnt = groupCounts[k];
+    if (cnt == 0) continue;
+
+    // copy members slice
+    uint16_t *slice = (uint16_t*)malloc(sizeof(uint16_t) * cnt);
+    if (!slice) { /* fallback: identity mapping for this group */ 
+      for (size_t i = 0; i < cnt; ++i) blockIdx[members[start + i]] = members[start + i];
+      continue;
+    }
+    for (size_t i = 0; i < cnt; ++i) slice[i] = members[start + i];
+
+    // shuffle 'slice' to obtain sources for destinations in 'members[start..]'
+    fy_shuffle_uint16(slice, cnt, prng);
+
+    // map: destination = members[start + i]  gets source = slice[i]
+    for (size_t i = 0; i < cnt; ++i) {
+      uint16_t dst = members[start + i];
+      uint16_t src = slice[i];
+      blockIdx[dst] = src;
+    }
+    free(slice);
+  }
+
+  // Build inverse mapping
+  uint16_t *invBlockIdx = (uint16_t*)malloc(sizeof(uint16_t) * totalBlocks);
+  if (!invBlockIdx) { free(blockIdx); free(blockDims); free(groupId); free(grows); free(gcols); free(groupCounts); free(groupOffsets); free(members); free(fillCursor); return; }
+  for (size_t i = 0; i < totalBlocks; ++i) invBlockIdx[blockIdx[i]] = (uint16_t)i;
+
+  // Generate operations deterministically for each original block
+  struct BlockOp { uint8_t type; uint8_t p1; int8_t p2; };
   const size_t MAX_OPS_PER_BLOCK = 6;
   BlockOp *ops = (BlockOp*)malloc(sizeof(BlockOp) * totalBlocks * MAX_OPS_PER_BLOCK);
-  if (!ops) { free(blockIdx); if (invBlockIdx) free(invBlockIdx); free(tmpBuf); return; }
+  if (!ops) { free(blockIdx); free(invBlockIdx); free(blockDims); free(groupId); free(grows); free(gcols); free(groupCounts); free(groupOffsets); free(members); free(fillCursor); return; }
 
-  // Fill ops deterministically using keyed PRNG
   for (size_t b = 0; b < totalBlocks; ++b) {
-    uint8_t opCount = 1 + (prng.nextByte() & 0x03); // 1..4 ops
+    uint8_t opCount = 1 + (prng.nextByte() & 0x03);
     for (size_t o = 0; o < MAX_OPS_PER_BLOCK; ++o) {
       BlockOp &op = ops[b * MAX_OPS_PER_BLOCK + o];
       if (o < opCount) {
@@ -167,23 +233,23 @@ void applyTranspositionEnhanced(uint8_t *data, const GridSpec &grid, const uint8
         uint8_t r2 = prng.nextByte();
         op.type = r1 & 0x07;
         op.p1 = r2;
-        op.p2 = (int8_t)(prng.nextByte() & 0x0F) - 8; // rotation offset -8..7
+        op.p2 = (int8_t)(prng.nextByte() & 0x0F) - 8;
       } else {
-        op.type = 0xFF; // terminator
+        op.type = 0xFF;
       }
     }
   }
 
-  // Helper: apply ops directly on tmpBuf that contains blockRows x blockCols
-  auto applyOpsOnTmpBuf = [&](uint8_t *buf, size_t blockRows, size_t blockCols, size_t blockIndex, PermuteMode modeLocal) {
+  // Helper apply ops on block by original block index
+  auto applyOpsOnBlock = [&](uint8_t *buf, size_t blockRows, size_t blockCols, size_t origBlockIndex, bool forward) {
     if (!buf) return;
-    size_t base = blockIndex * MAX_OPS_PER_BLOCK;
-    if (modeLocal == PermuteMode::Forward) {
+    size_t base = origBlockIndex * MAX_OPS_PER_BLOCK;
+    if (forward) {
       for (size_t o = 0; o < MAX_OPS_PER_BLOCK; ++o) {
         BlockOp &op = ops[base + o];
         if (op.type == 0xFF) break;
         switch (op.type & 0x07) {
-          case 0: { // rowSwap
+          case 0: {
             if (blockRows <= 1) break;
             size_t a = op.p1 % blockRows;
             size_t b = (op.p1 ^ 0x55) % blockRows;
@@ -195,7 +261,7 @@ void applyTranspositionEnhanced(uint8_t *data, const GridSpec &grid, const uint8
             }
             break;
           }
-          case 1: { // colSwap
+          case 1: {
             if (blockCols <= 1) break;
             size_t a = op.p1 % blockCols;
             size_t b = (op.p1 ^ 0x33) % blockCols;
@@ -207,7 +273,7 @@ void applyTranspositionEnhanced(uint8_t *data, const GridSpec &grid, const uint8
             }
             break;
           }
-          case 2: { // rowReverse
+          case 2: {
             for (size_t rr = 0; rr < blockRows; ++rr) {
               size_t a = rr * blockCols;
               size_t b = a + blockCols - 1;
@@ -217,7 +283,7 @@ void applyTranspositionEnhanced(uint8_t *data, const GridSpec &grid, const uint8
             }
             break;
           }
-          case 3: { // colReverse
+          case 3: {
             for (size_t cc = 0; cc < blockCols; ++cc) {
               size_t a = cc;
               size_t b = (blockRows - 1) * blockCols + cc;
@@ -227,12 +293,12 @@ void applyTranspositionEnhanced(uint8_t *data, const GridSpec &grid, const uint8
             }
             break;
           }
-          case 4: { // rowRotate
+          case 4: {
             int off = op.p2;
             for (size_t rr = 0; rr < blockRows; ++rr) rotateRowInBlock(buf, blockCols, rr, off);
             break;
           }
-          case 5: { // colRotate
+          case 5: {
             int off = op.p2;
             for (size_t cc = 0; cc < blockCols; ++cc) rotateColInBlock(buf, blockCols, blockRows, cc, off);
             break;
@@ -240,13 +306,13 @@ void applyTranspositionEnhanced(uint8_t *data, const GridSpec &grid, const uint8
           default: break;
         }
       }
-    } else { // Inverse: reverse order, invert rotation sign
+    } else {
       for (int o = (int)MAX_OPS_PER_BLOCK - 1; o >= 0; --o) {
         BlockOp &op = ops[base + o];
         if (op.type == 0xFF) continue;
         uint8_t t = op.type & 0x07;
         switch (t) {
-          case 0: { // rowSwap (self-inverse)
+          case 0: {
             if (blockRows <= 1) break;
             size_t a = op.p1 % blockRows;
             size_t b = (op.p1 ^ 0x55) % blockRows;
@@ -258,7 +324,7 @@ void applyTranspositionEnhanced(uint8_t *data, const GridSpec &grid, const uint8
             }
             break;
           }
-          case 1: { // colSwap
+          case 1: {
             if (blockCols <= 1) break;
             size_t a = op.p1 % blockCols;
             size_t b = (op.p1 ^ 0x33) % blockCols;
@@ -270,7 +336,7 @@ void applyTranspositionEnhanced(uint8_t *data, const GridSpec &grid, const uint8
             }
             break;
           }
-          case 2: { // rowReverse
+          case 2: {
             for (size_t rr = 0; rr < blockRows; ++rr) {
               size_t a = rr * blockCols;
               size_t b = a + blockCols - 1;
@@ -280,7 +346,7 @@ void applyTranspositionEnhanced(uint8_t *data, const GridSpec &grid, const uint8
             }
             break;
           }
-          case 3: { // colReverse
+          case 3: {
             for (size_t cc = 0; cc < blockCols; ++cc) {
               size_t a = cc;
               size_t b = (blockRows - 1) * blockCols + cc;
@@ -290,12 +356,12 @@ void applyTranspositionEnhanced(uint8_t *data, const GridSpec &grid, const uint8
             }
             break;
           }
-          case 4: { // rowRotate inverse: rotate by -p2
+          case 4: {
             int off = -op.p2;
             for (size_t rr = 0; rr < blockRows; ++rr) rotateRowInBlock(buf, blockCols, rr, off);
             break;
           }
-          case 5: { // colRotate inverse
+          case 5: {
             int off = -op.p2;
             for (size_t cc = 0; cc < blockCols; ++cc) rotateColInBlock(buf, blockCols, blockRows, cc, off);
             break;
@@ -304,97 +370,63 @@ void applyTranspositionEnhanced(uint8_t *data, const GridSpec &grid, const uint8
         }
       }
     }
-  }; // end applyOpsOnTmpBuf
+  };
 
-  // Now apply block permutation + per-block ops
+  // tmp buffer sized to largest block in group (blockH * blockW is an upper bound)
+  size_t maxBlockBytes = blockH * blockW ? (blockH * blockW) : 1;
+  uint8_t *tmpBuf = (uint8_t*)malloc(maxBlockBytes);
+  if (!tmpBuf) { /* cleanup */ free(blockIdx); free(invBlockIdx); free(ops); free(blockDims); free(groupId); free(grows); free(gcols); free(groupCounts); free(groupOffsets); free(members); free(fillCursor); return; }
+
+  // src copy so reads are stable while we write into 'data'
+  size_t totalBytes = grid.rows * grid.cols;
+  uint8_t *srcCopy = (uint8_t*)malloc(totalBytes);
+  if (!srcCopy) { free(tmpBuf); free(blockIdx); free(invBlockIdx); free(ops); free(blockDims); free(groupId); free(grows); free(gcols); free(groupCounts); free(groupOffsets); free(members); free(fillCursor); return; }
+  memcpy(srcCopy, data, totalBytes);
+
   if (mode == PermuteMode::Forward) {
-    size_t totalBytes = grid.rows * grid.cols;
-    uint8_t *srcCopy = (uint8_t*)malloc(totalBytes);
-    if (!srcCopy) { free(blockIdx); if (invBlockIdx) free(invBlockIdx); free(tmpBuf); free(ops); return; }
-    memcpy(srcCopy, data, totalBytes);
-
     for (size_t dstBlock = 0; dstBlock < totalBlocks; ++dstBlock) {
-      uint16_t srcBlock = blockIdx[dstBlock];
-
-      // compute src block coordinates
-      size_t brIdx = srcBlock / bc;
-      size_t bcIdx = srcBlock % bc;
-      size_t r0 = brIdx * blockH;
-      size_t c0 = bcIdx * blockW;
-      size_t r1 = (r0 + blockH) > grid.rows ? grid.rows : (r0 + blockH);
-      size_t c1 = (c0 + blockW) > grid.cols ? grid.cols : (c0 + blockW);
-      size_t blockRows = r1 - r0;
-      size_t blockCols = c1 - c0;
-
-      // read src block into tmpBuf
-      readBlock(srcCopy, grid, r0, r1, c0, c1, tmpBuf);
-
-      // apply intra-block ops on tmpBuf (forward)
-      applyOpsOnTmpBuf(tmpBuf, blockRows, blockCols, dstBlock, PermuteMode::Forward);
-
-      // write into destination position in data
-      size_t dbr = dstBlock / bc; size_t dbc = dstBlock % bc;
-      size_t dr0 = dbr * blockH; size_t dc0 = dbc * blockW;
-      size_t dr1 = (dr0 + blockH) > grid.rows ? grid.rows : (dr0 + blockH);
-      size_t dc1 = (dc0 + blockW) > grid.cols ? grid.cols : (dc0 + blockW);
-
-      writeBlock(data, grid, dr0, dr1, dc0, dc1, tmpBuf);
+      uint16_t srcBlock = blockIdx[dstBlock]; // original block index that will be placed at dstBlock
+      // read source block (original slot)
+      readBlock(srcCopy, grid, blockDims[srcBlock], tmpBuf);
+      // apply ops generated for srcBlock (forward)
+      applyOpsOnBlock(tmpBuf, blockDims[srcBlock].rows, blockDims[srcBlock].cols, srcBlock, true);
+      // write into dstBlock slot (same shape guaranteed by grouping)
+      writeBlock(data, grid, blockDims[dstBlock], tmpBuf);
     }
-
-    free(srcCopy);
   } else {
-    // Inverse: read blocks from permuted positions, apply inverse ops and write to original
-    size_t totalBytes = grid.rows * grid.cols;
-    uint8_t *srcCopy = (uint8_t*)malloc(totalBytes);
-    if (!srcCopy) { free(blockIdx); if (invBlockIdx) free(invBlockIdx); free(tmpBuf); free(ops); return; }
-    memcpy(srcCopy, data, totalBytes);
-
+    // inverse
     for (size_t srcBlock = 0; srcBlock < totalBlocks; ++srcBlock) {
-      uint16_t permPos = invBlockIdx[srcBlock];
-
-      size_t pr = permPos / bc; size_t pc = permPos % bc;
-      size_t r0 = pr * blockH;
-      size_t c0 = pc * blockW;
-      size_t r1 = (r0 + blockH) > grid.rows ? grid.rows : (r0 + blockH);
-      size_t c1 = (c0 + blockW) > grid.cols ? grid.cols : (c0 + blockW);
-      size_t blockRows = r1 - r0;
-      size_t blockCols = c1 - c0;
-
-      // read permuted block from srcCopy into tmpBuf
-      readBlock(srcCopy, grid, r0, r1, c0, c1, tmpBuf);
-
-      // apply inverse ops for that block index (permPos)
-      applyOpsOnTmpBuf(tmpBuf, blockRows, blockCols, permPos, PermuteMode::Inverse);
-
-      // write back to original (srcBlock) position in data
-      size_t dbr = srcBlock / bc; size_t dbc = srcBlock % bc;
-      size_t dr0 = dbr * blockH; size_t dc0 = dbc * blockW;
-      size_t dr1 = (dr0 + blockH) > grid.rows ? grid.rows : (dr0 + blockH);
-      size_t dc1 = (dc0 + blockW) > grid.cols ? grid.cols : (dc0 + blockW);
-
-      writeBlock(data, grid, dr0, dr1, dc0, dc1, tmpBuf);
+      uint16_t permPos = invBlockIdx[srcBlock]; // position in permuted array where original srcBlock sits
+      // read permuted data from permPos slot
+      readBlock(srcCopy, grid, blockDims[permPos], tmpBuf);
+      // apply inverse ops for original srcBlock (use the original shape)
+      applyOpsOnBlock(tmpBuf, blockDims[srcBlock].rows, blockDims[srcBlock].cols, srcBlock, false);
+      // write back to original slot
+      writeBlock(data, grid, blockDims[srcBlock], tmpBuf);
     }
-
-    free(srcCopy);
   }
 
   // cleanup
-  free(blockIdx);
-  if (invBlockIdx) free(invBlockIdx);
   free(tmpBuf);
+  free(srcCopy);
+  free(blockIdx);
+  free(invBlockIdx);
   free(ops);
+  free(blockDims);
+  free(groupId);
+  free(grows);
+  free(gcols);
+  free(groupCounts);
+  free(groupOffsets);
+  free(members);
+  free(fillCursor);
 }
 
-// ---------------------------------------------------------------------------
 // Public wrapper: accept 8-byte key and call enhanced implementation.
-// If caller already has 16-byte key, they can call applyTranspositionEnhanced directly.
-// ---------------------------------------------------------------------------
-void applyTransposition(uint8_t *data, const GridSpec &grid, const uint8_t key[8], PermuteMode mode)
-{
+void applyTransposition(uint8_t *data, const GridSpec &grid, const uint8_t key[8], PermuteMode mode) {
   uint8_t key16[16];
   if (key) {
     memcpy(key16, key, 8);
-    // Expand simple deterministic way to 16 bytes (not cryptographic KDF but deterministic)
     for (int i = 0; i < 8; ++i) {
       uint8_t a = key[i];
       uint8_t b = key[(i + 3) & 7];

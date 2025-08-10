@@ -1,112 +1,197 @@
+// crypto_kdf.cpp
 #include "crypto_kdf.h"
 #include <string.h>
 #include <mbedtls/md.h>
-#include <mbedtls/sha256.h>
+#include <mbedtls/platform_util.h> // for mbedtls_platform_zeroize if available
+#include <stdint.h>
+#include <stdlib.h>
 
-static bool hmac_sha256(const uint8_t *key, size_t keyLen,
-                        const uint8_t *data, size_t dataLen,
-                        uint8_t out[32])
+// -----------------------------------------------------------------------------
+// Helper: HMAC-SHA256 (wrapper)
+// -----------------------------------------------------------------------------
+static bool hmac_sha256(const uint8_t* key, size_t keyLen,
+                        const uint8_t* data, size_t dataLen,
+                        uint8_t out32[32])
 {
-  const mbedtls_md_info_t *info = mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
-  if (!info)
-    return false;
-
-  mbedtls_md_context_t ctx;
-  mbedtls_md_init(&ctx);
-  if (mbedtls_md_setup(&ctx, info, 1) != 0)
-  {
+    const mbedtls_md_info_t* info = mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
+    if (!info) return false;
+    mbedtls_md_context_t ctx;
+    mbedtls_md_init(&ctx);
+    if (mbedtls_md_setup(&ctx, info, 1) != 0) { mbedtls_md_free(&ctx); return false; }
+    if (mbedtls_md_hmac_starts(&ctx, key, keyLen) != 0) { mbedtls_md_free(&ctx); return false; }
+    if (data && dataLen) {
+        if (mbedtls_md_hmac_update(&ctx, data, dataLen) != 0) { mbedtls_md_free(&ctx); return false; }
+    }
+    if (mbedtls_md_hmac_finish(&ctx, out32) != 0) { mbedtls_md_free(&ctx); return false; }
     mbedtls_md_free(&ctx);
-    return false;
-  }
-  if (mbedtls_md_hmac_starts(&ctx, key, keyLen) != 0)
-  {
-    mbedtls_md_free(&ctx);
-    return false;
-  }
-  if (mbedtls_md_hmac_update(&ctx, data, dataLen) != 0)
-  {
-    mbedtls_md_free(&ctx);
-    return false;
-  }
-  if (mbedtls_md_hmac_finish(&ctx, out) != 0)
-  {
-    mbedtls_md_free(&ctx);
-    return false;
-  }
-  mbedtls_md_free(&ctx);
-  return true;
+    return true;
 }
 
-// RFC 8018 PBKDF2 with HMAC-SHA256
-bool pbkdf2_sha256(const uint8_t *password, size_t passLen,
-                   const uint8_t *salt, size_t saltLen,
-                   uint32_t iterations,
-                   uint8_t *out, size_t outLen)
+// Secure zero helper
+static void secure_zero(void* p, size_t n) {
+#if defined(mbedtls_platform_zeroize)
+    mbedtls_platform_zeroize(p, n);
+#else
+    volatile uint8_t *q = (volatile uint8_t *)p;
+    while (n--) *q++ = 0;
+#endif
+}
+
+// -----------------------------------------------------------------------------
+// HKDF Extract (PRK = HMAC(salt, IKM))
+// If salt==NULL or saltLen==0, use zeros of hashLen per RFC 5869
+// -----------------------------------------------------------------------------
+bool hkdf_extract(const uint8_t *salt, size_t saltLen,
+                  const uint8_t *ikm, size_t ikmLen,
+                  uint8_t prk[32])
 {
-  if (!password || !salt || !out || iterations == 0 || outLen == 0)
-    return false;
+    uint8_t zeroSalt[32] = {0};
+    if (!ikm || !prk) return false;
+    if (!salt || saltLen == 0) {
+        // per RFC, use a salt of zeros
+        return hmac_sha256(zeroSalt, sizeof(zeroSalt), ikm, ikmLen, prk);
+    } else {
+        return hmac_sha256(salt, saltLen, ikm, ikmLen, prk);
+    }
+}
 
-  uint32_t blockCount = (outLen + 31) / 32;
-  uint8_t U[32];
-  uint8_t T[32];
-  uint8_t *outPtr = out;
-  size_t remaining = outLen;
+// -----------------------------------------------------------------------------
+// HKDF Expand - info-based expansion
+// outLen must be <= 255*HashLen (we use SHA256, so large enough)
+// -----------------------------------------------------------------------------
+bool hkdf_expand(const uint8_t prk[32],
+                 const uint8_t *info, size_t infoLen,
+                 uint8_t *out, size_t outLen)
+{
+    if (!prk || !out || outLen == 0) return false;
+    const size_t hashLen = 32;
+    uint32_t n = (uint32_t)((outLen + hashLen - 1) / hashLen);
+    if (n == 0 || n > 255) return false;
 
-  for (uint32_t block = 1; block <= blockCount; ++block)
-  {
-    // salt || INT_32_BE(block)
-    uint8_t ibuf[64];
-    if (saltLen + 4 > sizeof(ibuf))
-      return false;
-    memcpy(ibuf, salt, saltLen);
-    ibuf[saltLen + 0] = (uint8_t)((block >> 24) & 0xFF);
-    ibuf[saltLen + 1] = (uint8_t)((block >> 16) & 0xFF);
-    ibuf[saltLen + 2] = (uint8_t)((block >> 8) & 0xFF);
-    ibuf[saltLen + 3] = (uint8_t)(block & 0xFF);
+    uint8_t T[32];
+    uint8_t previous[32];
+    size_t produced = 0;
+    uint8_t ctr = 1;
 
-    // U1 = HMAC(P, salt||block)
-    if (!hmac_sha256(password, passLen, ibuf, saltLen + 4, U))
-      return false;
-    memcpy(T, U, 32);
+    memset(previous, 0, sizeof(previous));
+    for (uint32_t i = 1; i <= n; ++i) {
+        // data = previous || info || ctr
+        // build data buffer in parts; use HMAC directly in sequence to avoid big buffer
+        const mbedtls_md_info_t* info_md = mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
+        if (!info_md) return false;
+        mbedtls_md_context_t ctx;
+        mbedtls_md_init(&ctx);
+        if (mbedtls_md_setup(&ctx, info_md, 1) != 0) { mbedtls_md_free(&ctx); return false; }
+        if (mbedtls_md_hmac_starts(&ctx, prk, 32) != 0) { mbedtls_md_free(&ctx); return false; }
+        // previous
+        if (i > 1) {
+            if (mbedtls_md_hmac_update(&ctx, previous, hashLen) != 0) { mbedtls_md_free(&ctx); return false; }
+        }
+        // info
+        if (info && infoLen) {
+            if (mbedtls_md_hmac_update(&ctx, info, infoLen) != 0) { mbedtls_md_free(&ctx); return false; }
+        }
+        // ctr byte
+        if (mbedtls_md_hmac_update(&ctx, &ctr, 1) != 0) { mbedtls_md_free(&ctx); return false; }
+        if (mbedtls_md_hmac_finish(&ctx, T) != 0) { mbedtls_md_free(&ctx); return false; }
+        mbedtls_md_free(&ctx);
 
-    for (uint32_t i = 2; i <= iterations; ++i)
-    {
-      if (!hmac_sha256(password, passLen, U, 32, U))
-        return false;
-      for (int k = 0; k < 32; ++k)
-        T[k] ^= U[k];
+        size_t copy = (produced + hashLen > outLen) ? (outLen - produced) : hashLen;
+        memcpy(out + produced, T, copy);
+        produced += copy;
+        memcpy(previous, T, hashLen);
+        ctr++;
     }
 
-    size_t toWrite = remaining < 32 ? remaining : 32;
-    memcpy(outPtr, T, toWrite);
-    outPtr += toWrite;
-    remaining -= toWrite;
-  }
-  return true;
+    // zero sensitive temporaries
+    secure_zero(T, sizeof(T));
+    secure_zero(previous, sizeof(previous));
+    return true;
 }
 
-bool deriveKeys(const uint8_t *masterSecret, size_t masterLen, DerivedKeys &out)
+// -----------------------------------------------------------------------------
+// High-level deriveKeys (HKDF-based)
+// -----------------------------------------------------------------------------
+bool deriveKeys(const uint8_t* masterSecret, size_t masterLen, DerivedKeys& out)
 {
-  if (!masterSecret || masterLen < 32)
-    return false;
+    if (!masterSecret || masterLen < 32) return false;
 
-  static const uint8_t salt[] = {
-      // Protocol/version salt — do not change without bumping version
-      'X', 'e', 'n', 'o', 'C', 'i', 'p', 'h', 'e', 'r', '-', 'K', 'D', 'F', '-', 'v', '1'};
-  uint8_t buf[64] = {0};
-  if (!pbkdf2_sha256(masterSecret, masterLen, salt, sizeof(salt), 1000, buf, sizeof(buf)))
-  {
-    return false;
-  }
+    // Protocol salt (can be constant). For better uniqueness, this could be combined
+    // with a device-unique value (e.g., MAC) at provisioning time. We keep a stable
+    // protocol salt for extract but use info labels to separate keys.
+    static const uint8_t protocol_salt[] = { 'X','e','n','o','C','i','p','h','e','r','-','H','K','D','F','v','1' };
 
-  // Split deterministically
-  out.lfsrSeed = (uint16_t)((buf[0] << 8) | buf[1]); // 2 bytes
-  memcpy(out.tinkerbellKey, buf + 2, 8);             // 8 bytes
-  memcpy(out.transpositionKey, buf + 10, 8);         // 8 bytes
-  memcpy(out.hmacKey, buf + 18, 32);                 // 32 bytes
-  // Remaining bytes reserved for future
-  // Ensure seed is non-zero
-  if (out.lfsrSeed == 0)
-    out.lfsrSeed = 0xACE1u;
-  return true;
+    uint8_t prk[32];
+    if (!hkdf_extract(protocol_salt, sizeof(protocol_salt), masterSecret, masterLen, prk)) {
+        return false;
+    }
+
+    // Expand separately for each subkey (domain separation via info)
+    // 1) LFSR seed (4 bytes)
+    {
+        const uint8_t info[] = { 'X','E','N','O','-','L','F','S','R','-','S','E','E','D' }; // info label
+        uint8_t outbuf[4];
+        if (!hkdf_expand(prk, info, sizeof(info), outbuf, sizeof(outbuf))) { secure_zero(prk, sizeof(prk)); return false; }
+        uint32_t seed = ((uint32_t)outbuf[0] << 24) | ((uint32_t)outbuf[1] << 16) | ((uint32_t)outbuf[2] << 8) | (uint32_t)outbuf[3];
+        out.lfsrSeed = seed ? seed : 0xACE1u; // ensure non-zero
+        secure_zero(outbuf, sizeof(outbuf));
+    }
+
+    // 2) Tinkerbell key (16 bytes)
+    {
+        const uint8_t info[] = { 'X','E','N','O','-','T','I','N','K','E','R','B','E','L','L','-','K' };
+        if (!hkdf_expand(prk, info, sizeof(info), out.tinkerbellKey, sizeof(out.tinkerbellKey))) { secure_zero(prk, sizeof(prk)); return false; }
+    }
+
+    // 3) Transposition key (16 bytes)
+    {
+        const uint8_t info[] = { 'X','E','N','O','-','T','R','A','N','S','P','O','S','-','K' };
+        if (!hkdf_expand(prk, info, sizeof(info), out.transpositionKey, sizeof(out.transpositionKey))) { secure_zero(prk, sizeof(prk)); return false; }
+    }
+
+    // 4) HMAC key (32 bytes)
+    {
+        const uint8_t info[] = { 'X','E','N','O','-','H','M','A','C','-','K','E','Y' };
+        if (!hkdf_expand(prk, info, sizeof(info), out.hmacKey, sizeof(out.hmacKey))) { secure_zero(prk, sizeof(prk)); return false; }
+    }
+
+    // Zero PRK
+    secure_zero(prk, sizeof(prk));
+    return true;
+}
+
+// -----------------------------------------------------------------------------
+// Per-message key derivation. Use base.hmacKey as PRK for message-specific expand.
+// Info = "XENO-MSGK" || nonce_be32
+// -----------------------------------------------------------------------------
+bool deriveMessageKeys(const DerivedKeys& base, uint32_t nonce, MessageKeys& out)
+{
+    // PRK = HMAC(salt=none, IKM = base.hmacKey) => but HKDF-Extract with zero salt is HMAC(zero, IKM)
+    // Simpler: use hkdf_extract with salt=NULL to produce prk via HMAC(zero, IKM)
+    uint8_t prk[32];
+    if (!hkdf_extract(NULL, 0, base.hmacKey, sizeof(base.hmacKey), prk)) return false;
+
+    // Build info = label || nonce_be32
+    uint8_t info[12];
+    const char label[] = "XENO-MSGK"; // 8 bytes
+    memcpy(info, label, 8);
+    info[8] = (uint8_t)((nonce >> 24) & 0xFF);
+    info[9] = (uint8_t)((nonce >> 16) & 0xFF);
+    info[10] = (uint8_t)((nonce >> 8) & 0xFF);
+    info[11] = (uint8_t)(nonce & 0xFF);
+
+    // total bytes needed = 4 + 16 + 16 = 36
+    uint8_t okm[36];
+    if (!hkdf_expand(prk, info, sizeof(info), okm, sizeof(okm))) { secure_zero(prk, sizeof(prk)); return false; }
+
+    // Fill out message keys (no XOR)
+    uint32_t seed = ((uint32_t)okm[0] << 24) | ((uint32_t)okm[1] << 16) | ((uint32_t)okm[2] << 8) | (uint32_t)okm[3];
+    out.lfsrSeed = seed ? seed : 0xACE1u;
+    memcpy(out.tinkerbellKey, okm + 4, 16);
+    memcpy(out.transpositionKey, okm + 20, 16);
+
+    // wipe temporaries
+    secure_zero(okm, sizeof(okm));
+    secure_zero(prk, sizeof(prk));
+    return true;
 }

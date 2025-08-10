@@ -1,23 +1,20 @@
-/**
- * transposition.h - Advanced transposition based on row/column swaps
- * - Grid is rows x cols (row-major)
- * - Swap sequence is derived from a secondary LFSR16 seeded with key bytes
- * - Supports forward (encrypt) and inverse (decrypt) permutations
- */
 #pragma once
 #include <stdint.h>
 #include <stddef.h>
 
-enum class PermuteMode
-{
-  Forward,
-  Inverse
+// Permutation mode
+enum class PermuteMode { Forward, Inverse };
+
+// Grid dimensions for transposition
+struct GridSpec {
+    size_t rows;
+    size_t cols;
 };
 
-struct GridSpec
-{
-  size_t rows;
-  size_t cols;
-};
-
+/**
+ * Standard transposition interface
+ * - key: 8 bytes (will be expanded internally to 16 bytes via simple KDF)
+ * - mode: Forward or Inverse permutation
+ * - grid: specifies the block layout
+ */
 void applyTransposition(uint8_t *data, const GridSpec &grid, const uint8_t key[8], PermuteMode mode);

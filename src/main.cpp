@@ -119,14 +119,16 @@ static void pipelineEncryptPacket(const DerivedKeys& baseKeys,
 
   // LFSR now uses LFSR32 with 16-bit seed
   {
-    LFSR32 lfsr((uint32_t)mk.lfsrSeed, 0x0029);
-    std::vector<uint8_t> ks(buf.size());
-    lfsr.generate(ks.data(), ks.size());
-    if (verbose) hexPrint("LFSR keystream", ks.data(), ks.size());
-    for (size_t i = 0; i < buf.size(); ++i) buf[i] ^= ks[i];
-    if (verbose) hexPrint("After LFSR", buf.data(), buf.size());
-    memset(ks.data(), 0, ks.size());
+  // Use ChaoticLFSR seeded with message seed and message tinkerbell key.
+  ChaoticLFSR32 lfsr((uint32_t)mk.lfsrSeed, mk.tinkerbellKey, 0x0029u);
+  lfsr.xorBuffer(buf.data(), buf.size()); // in-place XOR
+  if (verbose) {
+    // If you want to print keystream, generate into temp buffer instead of xorBuffer
+    // but here we printed final buffer after XOR
+    hexPrint("After ChaoticLFSR", buf.data(), buf.size());
   }
+}
+
 
   {
     Tinkerbell tk(mk.tinkerbellKey);
@@ -230,12 +232,10 @@ static bool pipelineDecryptPacket(const DerivedKeys& baseKeys,
   }
 
   {
-    LFSR32 lfsr((uint32_t)mk.lfsrSeed, 0x0029);
-    std::vector<uint8_t> ks(buf.size());
-    lfsr.generate(ks.data(), ks.size());
-    for (size_t i = 0; i < buf.size(); ++i) buf[i] ^= ks[i];
-    memset(ks.data(), 0, ks.size());
-  }
+  ChaoticLFSR32 lfsr((uint32_t)mk.lfsrSeed, mk.tinkerbellKey, 0x0029u);
+  lfsr.xorBuffer(buf.data(), buf.size());
+}
+
 
   recovered = std::move(buf);
   (void)payload_len;

@@ -1,45 +1,55 @@
-// transposition.cpp
-// Deterministic enhanced transposition using a keyed splitmix64 PRNG.
-// - Keeps public wrapper applyTransposition(key[8]) which expands to 16 bytes.
-// - applyTranspositionEnhanced(data, grid, key16, mode) is the worker.
-// - Uses dynamic buffers and robust bounds checks.
-// - Permutes blocks only within groups of identical (rows,cols) to ensure invertibility.
+// transposition.cpp  -- chaos-driven PRNG (Tinkerbell) replacement for splitmix64
+// Deterministic enhanced transposition using a keyed Tinkerbell-based PRNG.
+// All randomness consumed in exactly the same order for Forward and Inverse modes,
+// guaranteeing deterministic invertibility (same key -> same mapping).
 
 #include "transposition.h"
+#include "tinkerbell.h"   // uses your existing Tinkerbell class
 #include <string.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <stdio.h>
 
-// Simple keyed PRNG using splitmix64 for deterministic keyed randomness.
-struct KeyedPRNG {
-  uint64_t s;
-  KeyedPRNG(const uint8_t key16[16]) {
-    uint64_t a = 0, b = 0;
-    if (key16) {
-      for (int i = 0; i < 8; ++i) a = (a << 8) | (uint64_t)key16[i];
-      for (int i = 0; i < 8; ++i) b = (b << 8) | (uint64_t)key16[8 + i];
+// ---------------- ChaoticPRNG: deterministic PRNG based on Tinkerbell ----------------
+// Wraps a local Tinkerbell instance seeded with key16. Provides next64/next32/nextByte.
+struct ChaoticPRNG {
+  Tinkerbell tk;
+
+  // Construct from 16-byte key
+  ChaoticPRNG(const uint8_t key16[16]) : tk(key16) {
+    // Tinkerbell constructor in your file already does burn-in; do not re-burn here.
+  }
+
+  // produce one byte (0..255) by consuming tk.nextByte()
+  uint8_t nextByte() {
+    return tk.nextByte();
+  }
+
+  // produce 32-bit word by concatenating 4 bytes in big-endian order
+  uint32_t next32() {
+    uint32_t w = 0;
+    for (int i = 0; i < 4; ++i) {
+      w = (w << 8) | (uint32_t)nextByte();
     }
-    s = a ^ ((b << 1) | (b >> 63)) ^ 0x9E3779B97F4A7C15ULL;
-    if (s == 0) s = 0xDEADBEEFC0FFEEULL;
+    return w;
   }
+
+  // produce 64-bit word by concatenating 8 bytes in big-endian order
   uint64_t next64() {
-    uint64_t z = (s += 0x9E3779B97F4A7C15ULL);
-    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
-    z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
-    return z ^ (z >> 31);
+    uint64_t z = 0;
+    for (int i = 0; i < 8; ++i) {
+      z = (z << 8) | (uint64_t)nextByte();
+    }
+    return z;
   }
-  uint32_t next32() { return (uint32_t)(next64() & 0xFFFFFFFFu); }
-  uint8_t nextByte() { return (uint8_t)(next32() & 0xFFu); }
 };
 
-// Block dimension structure to ensure consistency
+// ---------------- existing helpers (unchanged) ----------------
 struct BlockDim {
   size_t rows, cols;
   size_t r0, r1, c0, c1;  // actual coordinates in grid
 };
 
-// Helper: read block into tmpBuf (row-major)
 static void readBlock(const uint8_t *data, const GridSpec &g, const BlockDim &block, uint8_t *tmpBuf) {
   size_t idx = 0;
   for (size_t r = block.r0; r < block.r1; ++r) {
@@ -49,7 +59,6 @@ static void readBlock(const uint8_t *data, const GridSpec &g, const BlockDim &bl
   }
 }
 
-// Helper: write block from tmpBuf back into data
 static void writeBlock(uint8_t *data, const GridSpec &g, const BlockDim &block, const uint8_t *tmpBuf) {
   size_t idx = 0;
   for (size_t r = block.r0; r < block.r1; ++r) {
@@ -59,7 +68,6 @@ static void writeBlock(uint8_t *data, const GridSpec &g, const BlockDim &block, 
   }
 }
 
-// In-place row rotate in a block: shift row by offset mod width
 static void rotateRowInBlock(uint8_t *block, size_t blockCols, size_t rowIndex, int offset) {
   if (blockCols == 0) return;
   offset = ((offset % (int)blockCols) + (int)blockCols) % (int)blockCols;
@@ -73,7 +81,6 @@ static void rotateRowInBlock(uint8_t *block, size_t blockCols, size_t rowIndex, 
   free(tmp);
 }
 
-// In-place column rotate in a block
 static void rotateColInBlock(uint8_t *block, size_t blockCols, size_t blockRows, size_t colIndex, int offset) {
   if (blockRows == 0) return;
   offset = ((offset % (int)blockRows) + (int)blockRows) % (int)blockRows;
@@ -85,8 +92,8 @@ static void rotateColInBlock(uint8_t *block, size_t blockCols, size_t blockRows,
   free(tmp);
 }
 
-// Fisher-Yates shuffle of array 'arr' of length n using KeyedPRNG
-static void fy_shuffle_uint16(uint16_t *arr, size_t n, KeyedPRNG &prng) {
+// Fisher-Yates shuffle (uint16_t) using ChaoticPRNG
+static void fy_shuffle_uint16(uint16_t *arr, size_t n, ChaoticPRNG &prng) {
   if (n <= 1) return;
   for (size_t i = n - 1; i > 0; --i) {
     uint32_t rnd32 = prng.next32();
@@ -97,7 +104,7 @@ static void fy_shuffle_uint16(uint16_t *arr, size_t n, KeyedPRNG &prng) {
   }
 }
 
-// Main enhanced transposition - completely deterministic, group-based
+// ---------------- Main enhanced transposition - now chaos-driven ----------------
 void applyTranspositionEnhanced(uint8_t *data, const GridSpec &grid, const uint8_t key[16], PermuteMode mode) {
   if (!data || grid.rows == 0 || grid.cols == 0) return;
 
@@ -114,7 +121,8 @@ void applyTranspositionEnhanced(uint8_t *data, const GridSpec &grid, const uint8
   size_t totalBlocks = br * bc;
   if (totalBlocks == 0) return;
 
-  KeyedPRNG prng(key);
+  // Use ChaoticPRNG seeded with the 16-byte key
+  ChaoticPRNG prng(key);
 
   // Pre-calc block dims for every original block index
   BlockDim *blockDims = (BlockDim*)malloc(sizeof(BlockDim) * totalBlocks);
@@ -201,7 +209,7 @@ void applyTranspositionEnhanced(uint8_t *data, const GridSpec &grid, const uint8
     }
     for (size_t i = 0; i < cnt; ++i) slice[i] = members[start + i];
 
-    // shuffle 'slice' to obtain sources for destinations in 'members[start..]'
+    // shuffle 'slice' using chaotic PRNG to obtain sources for destinations in 'members[start..]'
     fy_shuffle_uint16(slice, cnt, prng);
 
     // map: destination = members[start + i]  gets source = slice[i]
@@ -218,7 +226,7 @@ void applyTranspositionEnhanced(uint8_t *data, const GridSpec &grid, const uint8
   if (!invBlockIdx) { free(blockIdx); free(blockDims); free(groupId); free(grows); free(gcols); free(groupCounts); free(groupOffsets); free(members); free(fillCursor); return; }
   for (size_t i = 0; i < totalBlocks; ++i) invBlockIdx[blockIdx[i]] = (uint16_t)i;
 
-  // Generate operations deterministically for each original block
+  // Generate operations deterministically for each original block using chaotic PRNG
   struct BlockOp { uint8_t type; uint8_t p1; int8_t p2; };
   const size_t MAX_OPS_PER_BLOCK = 6;
   BlockOp *ops = (BlockOp*)malloc(sizeof(BlockOp) * totalBlocks * MAX_OPS_PER_BLOCK);
@@ -421,7 +429,7 @@ void applyTranspositionEnhanced(uint8_t *data, const GridSpec &grid, const uint8
   free(members);
   free(fillCursor);
 }
-
+  
 // Public wrapper: accept 8-byte key and call enhanced implementation.
 void applyTransposition(uint8_t *data, const GridSpec &grid, const uint8_t key[8], PermuteMode mode) {
   uint8_t key16[16];

@@ -52,3 +52,12 @@ private:
   static double fracFrom16(uint8_t hi, uint8_t lo);
   static inline uint32_t rotl32(uint32_t x, int r) { return (x << r) | (x >> (32 - r)); }
 };
+
+/*
+~ Generates a chaotic keystream that:
+  - Has high entropy from the chaotic map.
+  - Is hardened with polynomial nonlinearity.
+  - Is statistically whitened to avoid bias.
+~ Acts as a core PRNG for encryption in hybrid cryptographic system.
+~ Uses key-dependent chaos parameters, meaning different keys lead to completely different trajectories.
+*/

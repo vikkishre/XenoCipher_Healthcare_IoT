@@ -1,13 +1,16 @@
 #include <Arduino.h>
 #include <vector>
 #include <mbedtls/sha256.h>
+#include <nvs_flash.h>
+#include <nvs.h>
 
-#include "crypto_kdf.h"
-#include "lfsr.h"
-#include "tinkerbell.h"
-#include "transposition.h"
-#include "hmac.h"
-#include "entropy.h"
+#include "../lib/CryptoKDF/include/crypto_kdf.h"
+#include "../lib/LFSR/include/lfsr.h"
+#include "../lib/Tinkerbell/include/tinkerbell.h"
+#include "../lib/Transposition/include/transposition.h"
+#include "../lib/HMAC/include/hmac.h"
+#include "../lib/Entropy/include/entropy.h"
+#include "../lib/NTRU/include/ntru.h"
 
 #ifndef HMAC_TAG_LEN
 #define HMAC_TAG_LEN 16
@@ -78,6 +81,126 @@ static GridSpec selectGrid(size_t len) {
   return GridSpec{rows, cols};
 }
 
+static void store_public_key(const std::vector<uint8_t>& pub_bytes) {
+  nvs_handle_t handle;
+  if (nvs_open("storage", NVS_READWRITE, &handle) != ESP_OK) {
+    Serial.println("NVS open failed");
+    return;
+  }
+  esp_err_t err = nvs_set_blob(handle, "ntru_pub", pub_bytes.data(), pub_bytes.size());
+  if (err != ESP_OK) {
+    Serial.printf("NVS set_blob failed: %d\n", (int)err);
+    nvs_close(handle);
+    return;
+  }
+  err = nvs_commit(handle);
+  if (err != ESP_OK) {
+    Serial.printf("NVS commit failed: %d\n", (int)err);
+  } else {
+    Serial.printf("Saved public key (%u bytes) to NVS.\n", (unsigned)pub_bytes.size());
+  }
+  nvs_close(handle);
+}
+
+static bool parse_hex(const String& hex, std::vector<uint8_t>& out) {
+  out.clear();
+  String s;
+  s.reserve(hex.length());
+  for (size_t i = 0; i < (size_t)hex.length(); ++i) {
+    char c = hex[i];
+    if (c == ' ' || c == '\t' || c == '\r' || c == '\n') continue;
+    s += c;
+  }
+  if ((s.length() & 1) != 0) return false;
+  out.reserve(s.length() / 2);
+  for (size_t i = 0; i < (size_t)s.length(); i += 2) {
+    char hi = s[i];
+    char lo = s[i+1];
+    auto hexval = [](char ch) -> int {
+      if (ch >= '0' && ch <= '9') return ch - '0';
+      if (ch >= 'a' && ch <= 'f') return ch - 'a' + 10;
+      if (ch >= 'A' && ch <= 'F') return ch - 'A' + 10;
+      return -1;
+    };
+    int h = hexval(hi);
+    int l = hexval(lo);
+    if (h < 0 || l < 0) return false;
+    out.push_back((uint8_t)((h << 4) | l));
+  }
+  return true;
+}
+
+static void send_master_key(const uint8_t* master_key, size_t key_len) {
+  NTRU ntru;
+  Poly m, e;
+  NTRU::bytes_to_poly(std::vector<uint8_t>(master_key, master_key + key_len), m, key_len);
+  
+  std::vector<uint8_t> pub_bytes(NTRU_N * 2);
+  nvs_handle_t handle;
+  if (nvs_open("storage", NVS_READONLY, &handle) != ESP_OK) {
+    Serial.println("NVS open failed for public key");
+    return;
+  }
+  size_t len = pub_bytes.size();
+  esp_err_t err = nvs_get_blob(handle, "ntru_pub", pub_bytes.data(), &len);
+  nvs_close(handle);
+  if (err != ESP_OK) {
+    Serial.printf("NVS get_blob failed: %d\n", (int)err);
+    return;
+  }
+  
+  Poly h;
+  for (int i = 0; i < NTRU_N; ++i) {
+    h.coeffs[i] = (pub_bytes[i * 2] << 8) | pub_bytes[i * 2 + 1];
+  }
+  
+  ntru.encrypt(m, h, e);
+  std::vector<uint8_t> e_bytes(NTRU_N * 2);
+  for (int i = 0; i < NTRU_N; ++i) {
+    e_bytes[i * 2] = e.coeffs[i] >> 8;
+    e_bytes[i * 2 + 1] = e.coeffs[i] & 0xFF;
+  }
+  
+  Serial.print("ENCKEY:");
+  for (uint8_t b : e_bytes) {
+    Serial.printf("%02X", b);
+  }
+  Serial.println();
+}
+
+static void generateHealthData(char* buffer, size_t buffer_size, uint32_t cycle) {
+  // Simulate health data (heart rate: 60-100, SpO2: 95-100, steps: 0-10000)
+  uint8_t heart_rate = 60 + (esp_random() % 41); // 60-100
+  uint8_t spo2 = 95 + (esp_random() % 6);       // 95-100
+  uint16_t steps = esp_random() % 10001;        // 0-10000
+  snprintf(buffer, buffer_size, "HR-%u SPO2-%u STEPS-%u", heart_rate, spo2, steps);
+}
+
+static bool upload_encrypted_data(const std::vector<uint8_t>& packet) {
+  Serial.print("ENC_DATA:");
+  for (uint8_t b : packet) {
+    Serial.printf("%02X", b);
+  }
+  Serial.println();
+  unsigned long start = millis();
+  while (millis() - start < 5000) { // 5-second timeout
+    if (Serial.available()) {
+      String line = Serial.readStringUntil('\n');
+      line.trim();
+      if (line == "ENC_OK:Stored") {
+        Serial.println("Encrypted data stored successfully");
+        return true;
+      } else if (line.startsWith("ENC_ERR:")) {
+        Serial.println("Upload error: " + line.substring(8));
+        return false;
+      }
+    }
+    delay(10);
+  }
+  Serial.println("Upload timeout");
+  return false;
+}
+
 static DerivedKeys gBaseKeys;
 static uint8_t gMasterKey[32];
 static bool gReady = false;
@@ -117,18 +240,11 @@ static void pipelineEncryptPacket(const DerivedKeys& baseKeys,
   std::vector<uint8_t> buf = padToGrid(salted, saltedLen, grid);
   if (verbose) hexPrint("Plain (padded)", buf.data(), buf.size());
 
-  // LFSR now uses LFSR32 with 16-bit seed
   {
-  // Use ChaoticLFSR seeded with message seed and message tinkerbell key.
-  ChaoticLFSR32 lfsr((uint32_t)mk.lfsrSeed, mk.tinkerbellKey, 0x0029u);
-  lfsr.xorBuffer(buf.data(), buf.size()); // in-place XOR
-  if (verbose) {
-    // If you want to print keystream, generate into temp buffer instead of xorBuffer
-    // but here we printed final buffer after XOR
-    hexPrint("After ChaoticLFSR", buf.data(), buf.size());
+    ChaoticLFSR32 lfsr((uint32_t)mk.lfsrSeed, mk.tinkerbellKey, 0x0029u);
+    lfsr.xorBuffer(buf.data(), buf.size());
+    if (verbose) hexPrint("After ChaoticLFSR", buf.data(), buf.size());
   }
-}
-
 
   {
     Tinkerbell tk(mk.tinkerbellKey);
@@ -188,7 +304,6 @@ static bool pipelineDecryptPacket(const DerivedKeys& baseKeys,
   gridOut = GridSpec{rows, cols};
   saltMetaOut = SaltMeta{salt_pos, salt_len};
 
-  const size_t headerLen = 8;
   const uint8_t* noncePtr = hasNonce ? packet + headerLen : nullptr;
   uint32_t nonce = 0;
   if (hasNonce) {
@@ -232,10 +347,9 @@ static bool pipelineDecryptPacket(const DerivedKeys& baseKeys,
   }
 
   {
-  ChaoticLFSR32 lfsr((uint32_t)mk.lfsrSeed, mk.tinkerbellKey, 0x0029u);
-  lfsr.xorBuffer(buf.data(), buf.size());
-}
-
+    ChaoticLFSR32 lfsr((uint32_t)mk.lfsrSeed, mk.tinkerbellKey, 0x0029u);
+    lfsr.xorBuffer(buf.data(), buf.size());
+  }
 
   recovered = std::move(buf);
   (void)payload_len;
@@ -253,8 +367,6 @@ static void printEntropySummary(const EntropyReport& er) {
   Serial.print("Entropy analog[0..3]: ");
   for (int i = 0; i < 4; ++i) Serial.printf("%u ", er.analog_samples[i]);
   Serial.println();
-
-  // FIX: if jitter[] no longer exists, replace with dummy zeros or valid field
   Serial.print("Entropy jitter[0..3]: ");
   for (int i = 0; i < 4; ++i) Serial.printf("%u ", 0u);
   Serial.println();
@@ -275,7 +387,9 @@ static void runOnceWithMessage(const char* label, const uint8_t* plain, size_t p
   salt[1] = (uint8_t)((r >> 8) & 0xFF);
   meta = {(uint16_t)plen, (uint8_t)sizeof(salt)};
 
-  std::vector<uint8_t> salted = insertSalt(plain, plen, salt, sizeof(salt), meta);
+  std::vector<uint8_t> salted = insertSalt(plain, plen, salt, sizeof
+
+System: salt), meta);
 
   asciiPrint("Plain + Salt", salted.data(), salted.size());
   hexPrint("Plain + Salt (hex)", salted.data(), salted.size());
@@ -296,6 +410,8 @@ static void runOnceWithMessage(const char* label, const uint8_t* plain, size_t p
   hexPrint("Ciphertext", ct, ctLen);
   hexPrint("HMAC", tag, HMAC_TAG_LEN);
 
+  upload_encrypted_data(packet);
+
   std::vector<uint8_t> rec;
   SaltMeta parsed{};
   GridSpec parsedGrid{};
@@ -309,16 +425,21 @@ static void runOnceWithMessage(const char* label, const uint8_t* plain, size_t p
   }
 }
 
-static void buildDummySensorLine(char* out, size_t outCap, uint16_t hr, uint8_t spo2) {
-  snprintf(out, outCap, "HR-%u SPO2-%u", (unsigned)hr, (unsigned)spo2);
-}
-
 void setup() {
   Serial.begin(115200);
   delay(1500);
 
   Serial.println("\n=== XenoCipher Authenticated Pipeline ===");
   Serial.printf("PBKDF2 iterations: %u | HMAC tag len: %u bytes\n", (unsigned)KDF_ITERATIONS, (unsigned)HMAC_TAG_LEN);
+
+  esp_err_t nvs_err = nvs_flash_init();
+  if (nvs_err == ESP_ERR_NVS_NO_FREE_PAGES || nvs_err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+    nvs_flash_erase();
+    nvs_err = nvs_flash_init();
+  }
+  if (nvs_err != ESP_OK) {
+    Serial.printf("NVS init failed: %d\n", (int)nvs_err);
+  }
 
   EntropyReport er{};
   if (!gatherMasterKey(gMasterKey, &er)) {
@@ -327,6 +448,8 @@ void setup() {
   }
   hexPrint("Master key (32)", gMasterKey, 32);
   printEntropySummary(er);
+
+  send_master_key(gMasterKey, sizeof(gMasterKey));
 
   if (!deriveKeys(gMasterKey, sizeof(gMasterKey), gBaseKeys)) {
     Serial.println("KDF failed!");
@@ -357,18 +480,29 @@ void loop() {
     return;
   }
 
+  if (Serial.available()) {
+    String line = Serial.readStringUntil('\n');
+    line.trim();
+    if (line.startsWith("PUBHEX:")) {
+      String hex = line.substring(7);
+      std::vector<uint8_t> bytes;
+      if (parse_hex(hex, bytes)) {
+        store_public_key(bytes);
+        Serial.println("OK:Public key stored");
+      } else {
+        Serial.println("ERR:Invalid hex");
+      }
+    }
+  }
+
   uint32_t now = millis();
   if (now - gLastRunMs >= 3000 && gCycles < 30) {
     gLastRunMs = now;
-    uint16_t hr = 60 + (esp_random() % 45);
-    uint8_t spo2 = 95 + (esp_random() % 5);
-    char line[48];
-    buildDummySensorLine(line, sizeof(line), hr, spo2);
-
+    char data[48];
+    generateHealthData(data, sizeof(data), gCycles + 1);
     uint32_t nonce = esp_random();
     bool verbose = (gCycles < 2);
-    runOnceWithMessage("Periodic sensor payload", (const uint8_t*)line, strlen(line), nonce, verbose);
-
+    runOnceWithMessage("Periodic sensor payload", (const uint8_t*)data, strlen(data), nonce, verbose);
     gCycles++;
     if (gCycles == 30) {
       Serial.println("\nReached 30 cycles. Pausing periodic encryption.");

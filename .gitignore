@@ -1,5 +1,104 @@
-.pio
-.vscode/.browse.c_cpp.db*
-.vscode/c_cpp_properties.json
+# Build directories and outputs
+build/
+*.exe
+*.dll
+*.lib
+*.pdb
+*.ilk
+*.obj
+*.o
+*.a
+
+# CMake build files
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+install_manifest.txt
+*.cmake
+*.ninja
+*.ninja_deps
+*.ninja_log
+
+# vcpkg build artifacts
+vcpkg/installed/
+vcpkg/buildtrees/
+vcpkg/downloads/
+vcpkg/packages/
+vcpkg/scripts/buildsystems/vcpkg.cmake.cache
+vcpkg_installed/
+
+# PlatformIO (ESP32) build artifacts
+.pio/
+libdeps/
+.platformio/
+pio.ini
+
+# Visual Studio
+.vs/
+*.vcxproj.user
+x64/
+*.suo
+*.sln.docstates
+*.opensdf
+
+# Visual Studio Code
+.vscode/settings.json
 .vscode/launch.json
-.vscode/ipch
+.vscode/tasks.json
+.vscode/extensions.json
+
+# CLion/WebStorm/IntelliJ
+.idea/
+*.iml
+
+# Eclipse
+.project
+.cproject
+.settings/
+
+# Xcode
+*.xcworkspace/
+*.xcodeproj/project.xcworkspace/
+*.xcodeproj/xcuserdata/
+
+# Database files
+*.db
+*.sqlite
+*.sqlite3
+
+# Logs
+*.log
+logs/
+
+# OS generated files
+.DS_Store
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# Environment variables
+.env
+.env.local
+.env.*.local
+
+# Dependencies
+node_modules/
+vendor/
+
+# Sensitive files
+config.ini
+*.key
+*.pem
+*.crt
+*.cer
+*.config
+secrets.json
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Windows
+$RECYCLE.BIN/

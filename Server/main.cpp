@@ -11,6 +11,8 @@
 #include <sstream>
 #include <iomanip>
 #include <regex>
+#include <iostream>
+#include <random>
 #include "../lib/NTRU/include/ntru.h"
 
 using namespace web;
@@ -44,7 +46,7 @@ struct SaltMeta {
     uint8_t len;
 };
 
-// NTRU key pair
+// NTRU key pair - FIXED VERSION
 class NTRUServer {
 public:
     NTRUServer() : ntru() {
@@ -52,17 +54,34 @@ public:
     }
 
     std::vector<uint8_t> getPublicKey() const {
-        std::vector<uint8_t> bytes;
-        NTRU::poly_to_bytes(keyPair.h, bytes, NTRU_N * sizeof(int16_t));
+        std::vector<uint8_t> bytes(NTRU_N * 2); // 2 bytes per coefficient
+        for (int i = 0; i < NTRU_N; ++i) {
+            int16_t coeff = keyPair.h.coeffs[i];
+            bytes[i * 2] = (coeff >> 8) & 0xFF;
+            bytes[i * 2 + 1] = coeff & 0xFF;
+        }
         return bytes;
     }
 
     std::vector<uint8_t> decrypt(const std::vector<uint8_t>& encKey) {
+        if (encKey.size() != NTRU_N * 2) {
+            throw std::runtime_error("Invalid encrypted key size");
+        }
+        
         Poly e, m;
-        NTRU::bytes_to_poly(encKey, e, encKey.size());
+        
+        // Convert bytes to polynomial
+        for (int i = 0; i < NTRU_N; ++i) {
+            e.coeffs[i] = (encKey[i * 2] << 8) | encKey[i * 2 + 1];
+        }
+        
         ntru.decrypt(e, keyPair.f, m);
-        std::vector<uint8_t> bytes;
-        NTRU::poly_to_bytes(m, bytes, 32); // Assuming 32-byte master key
+        
+        // Convert polynomial back to bytes (take first 32 bytes)
+        std::vector<uint8_t> bytes(32);
+        for (int i = 0; i < 32; ++i) {
+            bytes[i] = m.coeffs[i] & 0xFF;
+        }
         return bytes;
     }
 
@@ -223,17 +242,51 @@ int main() {
     NTRUServer ntru;
     std::vector<uint8_t> masterKey;
 
+    // Test the public key generation
+    auto pubKey = ntru.getPublicKey();
+    std::cout << "Public key generated successfully!" << std::endl;
+    std::cout << "Public key size: " << pubKey.size() << " bytes" << std::endl;
+    
+    // Check if key looks reasonable (should not be all zeros)
+    bool allZeros = true;
+    for (const auto& byte : pubKey) {
+        if (byte != 0) {
+            allZeros = false;
+            break;
+        }
+    }
+    
+    if (allZeros) {
+        std::cerr << "ERROR: Public key is all zeros! NTRU key generation failed!" << std::endl;
+        return 1;
+    }
+    
+    std::cout << "First 16 bytes of public key: ";
+    for (int i = 0; i < 16 && i < pubKey.size(); ++i) {
+        printf("%02X ", pubKey[i]);
+    }
+    std::cout << std::endl;
+
     // HTTP server
-   http_listener listener(web::uri(U("http://+:8081")));
+    http_listener listener(web::uri(U("http://+:8081")));
 
     // GET /public-key
     listener.support(methods::GET, [&ntru](http_request req) {
-        if (req.relative_uri().to_string() == U("/public-key")) { // Fixed comparison
+        if (req.relative_uri().to_string() == U("/public-key")) {
             auto pubKey = ntru.getPublicKey();
             std::string pubHex = bytesToHex(pubKey);
+            
+            // Debug output
+            std::cout << "=== Sending Public Key ===" << std::endl;
+            std::cout << "Key length: " << pubKey.size() << " bytes" << std::endl;
+            std::cout << "First 16 bytes: ";
+            for (int i = 0; i < 16 && i < pubKey.size(); ++i) {
+                printf("%02X ", pubKey[i]);
+            }
+            std::cout << std::endl;
+            
             json::value response;
-            response[U("publicKey")] = json::value::string(U("PUBHEX:") + utility::conversions::to_string_t(pubHex)); // Fixed LpubHex to pubHex
-            std::cout << "Sent public key: " << pubHex << std::endl;
+            response[U("publicKey")] = json::value::string(U("PUBHEX:") + utility::conversions::to_string_t(pubHex));
             req.reply(status_codes::OK, response);
         } else {
             req.reply(status_codes::NotFound);
@@ -241,108 +294,89 @@ int main() {
     });
 
     // POST /master-key
-   listener.support(methods::POST, [&ntru, &conn, &masterKey](http_request req) {
-    if (req.relative_uri().to_string() == U("/master-key")) {
-        std::cout << "Received POST /master-key request" << std::endl;
-        req.extract_json().then([&](json::value body) {
-            try {
-                std::cout << "Extracting JSON body" << std::endl;
-                std::string encKey = utility::conversions::to_utf8string(body[U("encKey")].as_string());
-                std::cout << "encKey: " << encKey << std::endl;
-                if (encKey.substr(0, 7) != "ENCKEY:") {
-                    std::cerr << "Invalid master key format" << std::endl;
-                    req.reply(status_codes::BadRequest, json::value::object({{U("error"), json::value::string(U("Invalid ENCKEY format"))}}));
-                    return;
+    listener.support(methods::POST, [&ntru, &conn, &masterKey](http_request req) {
+        if (req.relative_uri().to_string() == U("/master-key")) {
+            std::cout << "Received POST /master-key request" << std::endl;
+            req.extract_json().then([&](json::value body) {
+                try {
+                    std::string encKey = utility::conversions::to_utf8string(body[U("data")].as_string());
+                    std::cout << "Received encrypted key: " << encKey.substr(0, 50) << "..." << std::endl;
+                    
+                    if (encKey.substr(0, 7) != "ENCKEY:") {
+                        std::cerr << "Invalid master key format" << std::endl;
+                        req.reply(status_codes::BadRequest, json::value::object({{U("error"), json::value::string(U("Invalid ENCKEY format"))}}));
+                        return;
+                    }
+                    
+                    std::string encKeyHex = encKey.substr(7);
+                    auto encKeyBytes = hexToBytes(encKeyHex);
+                    std::cout << "Decrypting " << encKeyBytes.size() << " bytes..." << std::endl;
+                    
+                    masterKey = ntru.decrypt(encKeyBytes);
+                    std::string masterKeyHex = bytesToHex(masterKey);
+                    
+                    std::cout << "Master key decrypted: " << masterKeyHex << std::endl;
+                    
+                    pqxx::work txn(conn);
+                    txn.exec_prepared("insert_master_key", masterKeyHex);
+                    txn.commit();
+                    
+                    req.reply(status_codes::OK, json::value::object({{U("status"), json::value::string(U("OK:Encrypted key received"))}}));
+                } catch (const std::exception& e) {
+                    std::cerr << "Error in /master-key: " << e.what() << std::endl;
+                    req.reply(status_codes::InternalError, json::value::object({{U("error"), json::value::string(U("Server error"))}}));
                 }
-                std::string encKeyHex = encKey.substr(7);
-                std::cout << "Converting hex to bytes" << std::endl;
-                auto encKeyBytes = hexToBytes(encKeyHex);
-                std::cout << "Starting NTRU decryption" << std::endl;
-                masterKey = ntru.decrypt(encKeyBytes);
-                std::cout << "NTRU decryption complete" << std::endl;
-                std::string masterKeyHex = bytesToHex(masterKey);
-                std::cout << "Connecting to database" << std::endl;
-                pqxx::work txn(conn);
-                std::cout << "Executing prepared statement: insert_master_key" << std::endl;
-                txn.exec_prepared("insert_master_key", masterKeyHex);
-                std::cout << "Committing transaction" << std::endl;
-                txn.commit();
-                std::cout << "Master key stored in database" << std::endl;
-                req.reply(status_codes::OK, json::value::object({{U("status"), json::value::string(U("OK:Encrypted key received"))}}));
-            } catch (const pqxx::sql_error& e) {
-                std::cerr << "Database Error: " << e.what() << std::endl;
-                web::json::value error_response;
-                error_response[U("error")] = web::json::value::string(U("Database error: ") + utility::conversions::to_string_t(e.what()));
-                req.reply(status_codes::InternalError, error_response);
-            } catch (const pqxx::broken_connection& e) {
-                std::cerr << "Database Connection Error: " << e.what() << std::endl;
-                web::json::value error_response;
-                error_response[U("error")] = web::json::value::string(U("Database connection error: ") + utility::conversions::to_string_t(e.what()));
-                req.reply(status_codes::InternalError, error_response);
-            } catch (const std::exception& e) {
-                std::cerr << "Standard Error: " << e.what() << std::endl;
-                web::json::value error_response;
-                error_response[U("error")] = web::json::value::string(U("Server error: ") + utility::conversions::to_string_t(e.what()));
-                req.reply(status_codes::InternalError, error_response);
-            } catch (...) {
-                std::cerr << "Unknown Error in /master-key" << std::endl;
-                web::json::value error_response;
-                error_response[U("error")] = web::json::value::string(U("Unknown server error"));
-                req.reply(status_codes::InternalError, error_response);
-            }
-        }).wait();
-    } else {
-        std::cout << "Ignoring non-/master-key POST request: " << utility::conversions::to_utf8string(req.relative_uri().to_string()) << std::endl;
-    }
-});
+            }).wait();
+        }
+    });
 
     // POST /health-data
     listener.support(methods::POST, [&conn, &masterKey](http_request req) {
-        if (req.relative_uri().to_string() == U("/health-data")) { // Fixed comparison
+        if (req.relative_uri().to_string() == U("/health-data")) {
             if (masterKey.empty()) {
-                std::cerr << "No master key available" << std::endl;
                 req.reply(status_codes::BadRequest, json::value::object({{U("error"), json::value::string(U("No master key"))}}));
                 return;
             }
+            
             req.extract_json().then([&](json::value body) {
-                std::string encData = utility::conversions::to_utf8string(body[U("encData")].as_string());
-                if (encData.substr(0, 9) != "ENC_DATA:") {
-                    std::cerr << "Invalid data format" << std::endl;
-                    req.reply(status_codes::BadRequest, json::value::object({{U("error"), json::value::string(U("Invalid ENC_DATA format"))}}));
-                    return;
-                }
-                std::string packetHex = encData.substr(9);
                 try {
+                    std::string encData = utility::conversions::to_utf8string(body[U("data")].as_string());
+                    
+                    if (encData.substr(0, 9) != "ENC_DATA:") {
+                        req.reply(status_codes::BadRequest, json::value::object({{U("error"), json::value::string(U("Invalid ENC_DATA format"))}}));
+                        return;
+                    }
+                    
+                    std::string packetHex = encData.substr(9);
                     auto packet = hexToBytes(packetHex);
+                    
                     BaseKeys baseKeys;
                     deriveKeys(masterKey, baseKeys);
                     std::string decrypted = pipelineDecryptPacket(baseKeys, packet, packet.size());
+                    
                     if (decrypted.empty()) {
-                        std::cerr << "Decryption failed" << std::endl;
                         req.reply(status_codes::BadRequest, json::value::object({{U("error"), json::value::string(U("Decryption failed"))}}));
                         return;
                     }
 
-                    // Parse decrypted data (format: HR-<heart_rate> SPO2-<spo2> STEPS-<steps>)
                     std::regex regex("HR-(\\d+) SPO2-(\\d+) STEPS-(\\d+)");
                     std::smatch match;
                     if (!std::regex_match(decrypted, match, regex)) {
-                        std::cerr << "Invalid data format after decryption" << std::endl;
                         req.reply(status_codes::BadRequest, json::value::object({{U("error"), json::value::string(U("Invalid data format"))}}));
                         return;
                     }
+                    
                     int heart_rate = std::stoi(match[1]);
                     int spo2 = std::stoi(match[2]);
                     int steps = std::stoi(match[3]);
 
-                    // Store in health_data
                     pqxx::work txn(conn);
                     txn.exec_prepared("insert_health_data", heart_rate, spo2, steps);
                     txn.commit();
-                    std::cout << "Health data stored: HR=" << heart_rate << ", SPO2=" << spo2 << ", Steps=" << steps << std::endl;
+                    
                     req.reply(status_codes::OK, json::value::object({{U("status"), json::value::string(U("ENC_OK:Stored"))}}));
                 } catch (const std::exception& e) {
-                    std::cerr << "Error: " << e.what() << std::endl;
+                    std::cerr << "Error in /health-data: " << e.what() << std::endl;
                     req.reply(status_codes::InternalError, json::value::object({{U("error"), json::value::string(U("Server error"))}}));
                 }
             }).wait();
@@ -358,11 +392,12 @@ int main() {
 
         listener.open().wait();
         std::cout << "Server running on http://localhost:8081" << std::endl;
+        std::cout << "Press Enter to stop the server..." << std::endl;
         std::string line;
-        std::getline(std::cin, line); // Keep server running until input
+        std::getline(std::cin, line);
         listener.close().wait();
     } catch (const std::exception& e) {
-        std::cerr << "Error: " << e.what() << std::endl;
+        std::cerr << "Server Error: " << e.what() << std::endl;
     }
 
     return 0;

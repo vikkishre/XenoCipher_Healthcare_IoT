@@ -1,0 +1,34 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="17.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup>
+    <ClCompile Include="D:\Projects\XenoCipher_Healthcare_IoT\server\main.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="D:\Projects\XenoCipher_Healthcare_IoT\lib\NTRU\src\ntru.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="D:\Projects\XenoCipher_Healthcare_IoT\lib\CryptoKDF\src\crypto_kdf.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="D:\Projects\XenoCipher_Healthcare_IoT\lib\HMAC\src\hmac.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="D:\Projects\XenoCipher_Healthcare_IoT\lib\LFSR\src\lfsr.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="D:\Projects\XenoCipher_Healthcare_IoT\lib\Tinkerbell\src\tinkerbell.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="D:\Projects\XenoCipher_Healthcare_IoT\lib\Transposition\src\transposition.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+  </ItemGroup>
+  <ItemGroup>
+    <CustomBuild Include="D:\Projects\XenoCipher_Healthcare_IoT\server\CMakeLists.txt" />
+  </ItemGroup>
+  <ItemGroup>
+    <Filter Include="Source Files">
+      <UniqueIdentifier>{A3DD7099-C3D0-3067-8C87-79EE9F01B8ED}</UniqueIdentifier>
+    </Filter>
+  </ItemGroup>
+</Project>

@@ -1,0 +1,15 @@
+{
+	"folders": [
+		{
+			"name": "XenoCipher_Healthcare_IoT",
+			"path": "."
+		}
+	],
+	"settings": {
+		"files.associations": {
+			"*.h": "c",
+			"*.cpp": "cpp",
+			"*.ino": "cpp"
+		}
+	}
+}

@@ -1,0 +1,13 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="17.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup>
+    <CustomBuild Include="D:\Projects\XenoCipher_Healthcare_IoT\server\build\CMakeFiles\b7cacb24581c676d0b6381436a22f44c\generate.stamp.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+  </ItemGroup>
+  <ItemGroup>
+    <Filter Include="CMake Rules">
+      <UniqueIdentifier>{10DD62DC-B60E-30E0-B3B0-048A31B3E2A7}</UniqueIdentifier>
+    </Filter>
+  </ItemGroup>
+</Project>

@@ -1,5 +1,10 @@
 #include "lfsr.h"
+#if defined(ARDUINO) || defined(ESP_PLATFORM)
 #include <Arduino.h>
+#else
+#include <cstdint>
+#include <cstring>
+#endif
 
 // Efficient parity calculation for 32-bit
 static inline uint8_t parity32(uint32_t x) {

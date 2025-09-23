@@ -45,6 +45,12 @@ typedef struct {
  */
 bool gatherMasterKey(uint8_t out32[32], EntropyReport *report /* optional, can be NULL */);
 
+/**
+ * Print a brief, non-sensitive summary of the entropy report to Serial.
+ * Safe to call with NULL (no-op).
+ */
+void printEntropySummary(const EntropyReport *report);
+
 #ifdef __cplusplus
 }
 #endif

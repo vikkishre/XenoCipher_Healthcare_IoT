@@ -165,3 +165,20 @@ bool gatherMasterKey(uint8_t out32[32], EntropyReport *report) {
   secure_zero(&localReport, sizeof(localReport));
   return true;
 }
+
+void printEntropySummary(const EntropyReport *report) {
+  if (!report) return;
+  Serial.printf("Entropy time_us: %llu\n", (unsigned long long)report->time_us);
+  Serial.print("Entropy MAC: ");
+  for (int i = 0; i < 6; ++i) {
+    Serial.printf("%02X", report->mac[i]);
+    if (i < 5) Serial.print(":");
+  }
+  Serial.println();
+  Serial.print("Entropy analog[0..3]: ");
+  for (int i = 0; i < 4; ++i) Serial.printf("%u ", report->analog_samples[i]);
+  Serial.println();
+  Serial.print("Entropy jitter[0..3]: ");
+  for (int i = 0; i < 4; ++i) Serial.printf("%u ", report->jitter_samples[i]);
+  Serial.println();
+}

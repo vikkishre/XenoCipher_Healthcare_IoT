@@ -1,4 +1,4 @@
-// crypto_kdf.cpp
+#include "../../../lib/common/common.h"
 #include "crypto_kdf.h"
 #include <string.h>
 #include <mbedtls/md.h>
@@ -9,6 +9,11 @@
 // -----------------------------------------------------------------------------
 // Helper: HMAC-SHA256 (wrapper)
 // -----------------------------------------------------------------------------
+
+// Returns boolean success/failure.
+// out32 receives the 32-byte HMAC result.
+// The function frees the mbedTLS context on failures too.
+
 static bool hmac_sha256(const uint8_t* key, size_t keyLen,
                         const uint8_t* data, size_t dataLen,
                         uint8_t out32[32])
@@ -28,6 +33,8 @@ static bool hmac_sha256(const uint8_t* key, size_t keyLen,
 }
 
 // Secure zero helper
+// To help Avoid leaving sensitive keys in memory after use
+// Uses mbedtls_platform_zeroize if available, else a volatile pointer method 
 static void secure_zero(void* p, size_t n) {
 #if defined(mbedtls_platform_zeroize)
     mbedtls_platform_zeroize(p, n);
@@ -39,20 +46,24 @@ static void secure_zero(void* p, size_t n) {
 
 // -----------------------------------------------------------------------------
 // HKDF Extract (PRK = HMAC(salt, IKM))
-// If salt==NULL or saltLen==0, use zeros of hashLen per RFC 5869
+// If salt==NULL or saltLen==0, use a predefined common salt (lets use in addaptive switching)
 // -----------------------------------------------------------------------------
+
+
 bool hkdf_extract(const uint8_t *salt, size_t saltLen,
                   const uint8_t *ikm, size_t ikmLen,
-                  uint8_t prk[32])
-{
-    uint8_t zeroSalt[32] = {0};
+                  uint8_t prk[32]) {
     if (!ikm || !prk) return false;
+
+    const uint8_t* effectiveSalt = salt;
+    size_t effectiveSaltLen = saltLen;
+
     if (!salt || saltLen == 0) {
-        // per RFC, use a salt of zeros
-        return hmac_sha256(zeroSalt, sizeof(zeroSalt), ikm, ikmLen, prk);
-    } else {
-        return hmac_sha256(salt, saltLen, ikm, ikmLen, prk);
+        effectiveSalt = BACKUP_COMMON_SALT;
+        effectiveSaltLen = sizeof(BACKUP_COMMON_SALT);
     }
+
+    return hmac_sha256(effectiveSalt, effectiveSaltLen, ikm, ikmLen, prk);
 }
 
 // -----------------------------------------------------------------------------
@@ -116,13 +127,14 @@ bool deriveKeys(const uint8_t* masterSecret, size_t masterLen, DerivedKeys& out)
 {
     if (!masterSecret || masterLen < 32) return false;
 
-    // Protocol salt (can be constant). For better uniqueness, this could be combined
-    // with a device-unique value (e.g., MAC) at provisioning time. We keep a stable
-    // protocol salt for extract but use info labels to separate keys.
-    static const uint8_t protocol_salt[] = { 'X','e','n','o','C','i','p','h','e','r','-','H','K','D','F','v','1' };
+    // The master key is used directly for the encryption algorithms
+    // The salt is now a shared secret and not derived from the master key
+    
+    // For the purpose of key derivation for the encryption algorithms, we can use a fixed info string
+    const uint8_t info[] = { 'X','E','N','O','-','E','N','C','-','K','E','Y','S' };
 
     uint8_t prk[32];
-    if (!hkdf_extract(protocol_salt, sizeof(protocol_salt), masterSecret, masterLen, prk)) {
+    if (!hkdf_extract((const uint8_t*)COMMON_SALT, strlen(COMMON_SALT), masterSecret, masterLen, prk)) {
         return false;
     }
 

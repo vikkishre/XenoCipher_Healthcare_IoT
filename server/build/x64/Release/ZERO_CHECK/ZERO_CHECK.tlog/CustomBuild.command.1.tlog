@@ -1,0 +1,10 @@
+^D:\PROJECTS\XENOCIPHER_HEALTHCARE_IOT\SERVER\BUILD\CMAKEFILES\B7CACB24581C676D0B6381436A22F44C\GENERATE.STAMP.RULE
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -SD:/Projects/XenoCipher_Healthcare_IoT/server -BD:/Projects/XenoCipher_Healthcare_IoT/server/build --check-stamp-list CMakeFiles/generate.stamp.list --vs-solution-file D:/Projects/XenoCipher_Healthcare_IoT/server/build/XenoCipherServer.sln
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal & call :cmErrorLevel %errorlevel% & goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd

@@ -33,6 +33,9 @@ public:
     void decrypt(const Poly& e, const Poly& f, Poly& m);
     static void bytes_to_poly(const std::vector<uint8_t>& bytes, Poly& poly, size_t len);
     static void poly_to_bytes(const Poly& poly, std::vector<uint8_t>& bytes, size_t len);
+    // 16-bit per coefficient (big-endian) serialization helpers
+    static void bytes_to_poly16(const std::vector<uint8_t>& bytes, Poly& poly);
+    static void poly_to_bytes16(const Poly& poly, std::vector<uint8_t>& bytes);
 private:
     void poly_mult(const Poly& a, const Poly& b, Poly& res);
     void poly_inv(const Poly& a, Poly& res, int mod);

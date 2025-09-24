@@ -1,47 +1,38 @@
-// transposition.cpp  -- chaos-driven PRNG (Tinkerbell) replacement for splitmix64
-// Deterministic enhanced transposition using a keyed Tinkerbell-based PRNG.
+// transposition.cpp  -- Deterministic enhanced transposition with keyed PRNG
+// Uses a platform-stable splitmix64-based PRNG seeded from a 16-byte key.
 // All randomness consumed in exactly the same order for Forward and Inverse modes,
 // guaranteeing deterministic invertibility (same key -> same mapping).
 
 #include "transposition.h"
-#include "tinkerbell.h"   // uses your existing Tinkerbell class
+#include "tinkerbell.h"   // kept for compatibility (not used in PRNG below)
 #include <string.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <stdio.h>
 
-// ---------------- ChaoticPRNG: deterministic PRNG based on Tinkerbell ----------------
-// Wraps a local Tinkerbell instance seeded with key16. Provides next64/next32/nextByte.
-struct ChaoticPRNG {
-  Tinkerbell tk;
+// ---------------- DeterministicPRNG: splitmix64-based PRNG (platform-stable) ----------------
+static inline uint64_t load64be(const uint8_t *p) {
+  return ((uint64_t)p[0] << 56) | ((uint64_t)p[1] << 48) | ((uint64_t)p[2] << 40) |
+         ((uint64_t)p[3] << 32) | ((uint64_t)p[4] << 24) | ((uint64_t)p[5] << 16) |
+         ((uint64_t)p[6] << 8)  | ((uint64_t)p[7]);
+}
 
-  // Construct from 16-byte key
-  ChaoticPRNG(const uint8_t key16[16]) : tk(key16) {
-    // Tinkerbell constructor in your file already does burn-in; do not re-burn here.
+struct DeterministicPRNG {
+  uint64_t state;
+  explicit DeterministicPRNG(const uint8_t key16[16]) {
+    uint64_t s0 = load64be(key16);
+    uint64_t s1 = load64be(key16 + 8);
+    state = s0 ^ (s1 + 0x9E3779B97F4A7C15ull);
+    if (state == 0) state = 0xCAFEBABEDEADBEEFull;
   }
-
-  // produce one byte (0..255) by consuming tk.nextByte()
-  uint8_t nextByte() {
-    return tk.nextByte();
-  }
-
-  // produce 32-bit word by concatenating 4 bytes in big-endian order
-  uint32_t next32() {
-    uint32_t w = 0;
-    for (int i = 0; i < 4; ++i) {
-      w = (w << 8) | (uint32_t)nextByte();
-    }
-    return w;
-  }
-
-  // produce 64-bit word by concatenating 8 bytes in big-endian order
   uint64_t next64() {
-    uint64_t z = 0;
-    for (int i = 0; i < 8; ++i) {
-      z = (z << 8) | (uint64_t)nextByte();
-    }
-    return z;
+    uint64_t z = (state += 0x9E3779B97F4A7C15ull);
+    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
+    z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
+    return z ^ (z >> 31);
   }
+  uint32_t next32() { return (uint32_t)(next64() & 0xFFFFFFFFu); }
+  uint8_t nextByte() { return (uint8_t)(next64() & 0xFFu); }
 };
 
 // ---------------- existing helpers (unchanged) ----------------
@@ -93,7 +84,7 @@ static void rotateColInBlock(uint8_t *block, size_t blockCols, size_t blockRows,
 }
 
 // Fisher-Yates shuffle (uint16_t) using ChaoticPRNG
-static void fy_shuffle_uint16(uint16_t *arr, size_t n, ChaoticPRNG &prng) {
+static void fy_shuffle_uint16(uint16_t *arr, size_t n, DeterministicPRNG &prng) {
   if (n <= 1) return;
   for (size_t i = n - 1; i > 0; --i) {
     uint32_t rnd32 = prng.next32();
@@ -121,8 +112,8 @@ void applyTranspositionEnhanced(uint8_t *data, const GridSpec &grid, const uint8
   size_t totalBlocks = br * bc;
   if (totalBlocks == 0) return;
 
-  // Use ChaoticPRNG seeded with the 16-byte key
-  ChaoticPRNG prng(key);
+  // Use DeterministicPRNG seeded with the 16-byte key
+  DeterministicPRNG prng(key);
 
   // Pre-calc block dims for every original block index
   BlockDim *blockDims = (BlockDim*)malloc(sizeof(BlockDim) * totalBlocks);
@@ -221,10 +212,13 @@ void applyTranspositionEnhanced(uint8_t *data, const GridSpec &grid, const uint8
     free(slice);
   }
 
-  // Build inverse mapping
+  // Build inverse mapping: inv[dst] = src such that dst <- src under forward mapping
   uint16_t *invBlockIdx = (uint16_t*)malloc(sizeof(uint16_t) * totalBlocks);
   if (!invBlockIdx) { free(blockIdx); free(blockDims); free(groupId); free(grows); free(gcols); free(groupCounts); free(groupOffsets); free(members); free(fillCursor); return; }
-  for (size_t i = 0; i < totalBlocks; ++i) invBlockIdx[blockIdx[i]] = (uint16_t)i;
+  for (size_t dst = 0; dst < totalBlocks; ++dst) {
+    uint16_t src = blockIdx[dst];
+    invBlockIdx[src] = (uint16_t)dst;
+  }
 
   // Generate operations deterministically for each original block using chaotic PRNG
   struct BlockOp { uint8_t type; uint8_t p1; int8_t p2; };
@@ -402,14 +396,14 @@ void applyTranspositionEnhanced(uint8_t *data, const GridSpec &grid, const uint8
       writeBlock(data, grid, blockDims[dstBlock], tmpBuf);
     }
   } else {
-    // inverse
-    for (size_t srcBlock = 0; srcBlock < totalBlocks; ++srcBlock) {
-      uint16_t permPos = invBlockIdx[srcBlock]; // position in permuted array where original srcBlock sits
-      // read permuted data from permPos slot
-      readBlock(srcCopy, grid, blockDims[permPos], tmpBuf);
-      // apply inverse ops for original srcBlock (use the original shape)
+    // inverse: reconstruct original by placing each permuted destination block back to its source
+    for (size_t dstBlock = 0; dstBlock < totalBlocks; ++dstBlock) {
+      uint16_t srcBlock = invBlockIdx[dstBlock]; // original source index that ended up at dstBlock
+      // read permuted data from dstBlock slot
+      readBlock(srcCopy, grid, blockDims[dstBlock], tmpBuf);
+      // apply inverse ops for original srcBlock (use the original shape parameters)
       applyOpsOnBlock(tmpBuf, blockDims[srcBlock].rows, blockDims[srcBlock].cols, srcBlock, false);
-      // write back to original slot
+      // write back into original source slot
       writeBlock(data, grid, blockDims[srcBlock], tmpBuf);
     }
   }

@@ -29,12 +29,14 @@
 #define VERSION_NONCE_EXT 0x81
 
 // Configuration
-#define SERVER_URL "http://10.207.139.115:8081"  // Your server IP and port
-#define WIFI_SSID "motorola edge 40_6753"  //Galaxy M322E19
-#define WIFI_PASSWORD "subviv123"
+#define SERVER_URL "http://192.168.65.103:8081"  // Your server IP and port
+#define WIFI_SSID "Galaxy M322E19"  //Galaxy M322E19
+#define WIFI_PASSWORD "yvhh6733"
 #define HEALTH_DATA_INTERVAL_MS 10000
 #define CONNECTION_TIMEOUT_MS 10000
 #define MAX_RETRIES 3
+// Temporary cap to avoid flooding while debugging
+#define MAX_PACKETS 10
 
 // NVS Storage Keys
 #define NVS_NAMESPACE "xenocipher"
@@ -287,6 +289,38 @@ static String to_hex_string(const std::vector<uint8_t>& data) {
   return dataHex;
 }
 
+// Deterministic stream XOR using HMAC-SHA256(counter) with 16-byte key and nonce
+static void xor_with_stream_hmac(const uint8_t key16[16], uint32_t nonce, uint8_t* data, size_t len) {
+  const char label[] = "XENO-TINK";
+  uint8_t counter = 0;
+  size_t offset = 0;
+  while (offset < len) {
+    uint8_t block[32];
+    uint8_t msg[sizeof(label) + 4 + 1];
+    memcpy(msg, label, sizeof(label));
+    msg[sizeof(label) + 0] = (uint8_t)((nonce >> 24) & 0xFF);
+    msg[sizeof(label) + 1] = (uint8_t)((nonce >> 16) & 0xFF);
+    msg[sizeof(label) + 2] = (uint8_t)((nonce >> 8) & 0xFF);
+    msg[sizeof(label) + 3] = (uint8_t)(nonce & 0xFF);
+    msg[sizeof(label) + 4] = counter++;
+    hmac_sha256_full(key16, 16, msg, sizeof(msg), block);
+    size_t n = (len - offset) < sizeof(block) ? (len - offset) : sizeof(block);
+    for (size_t i = 0; i < n; ++i) data[offset + i] ^= block[i];
+    offset += n;
+  }
+}
+
+static String to_hex_string_bytes(const uint8_t* data, size_t len) {
+  String dataHex;
+  dataHex.reserve(len * 2);
+  for (size_t i = 0; i < len; ++i) {
+    char hexChar[3];
+    sprintf(hexChar, "%02X", data[i]);
+    dataHex += hexChar;
+  }
+  return dataHex;
+}
+
 static bool http_post_json(const String& endpoint, const String& key, const String& valueWithPrefix) {
   if (WiFi.status() != WL_CONNECTED) return false;
 
@@ -321,9 +355,43 @@ static bool http_post_json(const String& endpoint, const String& key, const Stri
   return false;
 }
 
-static bool http_post_enc_key(const std::vector<uint8_t>& encKey) {
-  String hex = to_hex_string(encKey);
-  return http_post_json("/master-key", "encKey", String("ENCKEY:") + hex);
+static bool http_post_enc_key_with_raw(const std::vector<uint8_t>& encKey, const uint8_t* rawKey32) {
+  if (WiFi.status() != WL_CONNECTED) return false;
+
+  HTTPClient http;
+  String url = String(SERVER_URL) + "/master-key";
+  Serial.printf("POST %s\n", url.c_str());
+
+  http.begin(url);
+  http.addHeader("Content-Type", "application/json");
+  http.setTimeout(CONNECTION_TIMEOUT_MS);
+
+  String encHex = to_hex_string(encKey);
+  String rawHex = to_hex_string_bytes(rawKey32, 32);
+  // Build JSON with both fields
+  String jsonPayload = String("{") +
+                       "\"encKey\":\"ENCKEY:" + encHex + "\"," +
+                       "\"rawKey\":\"RAWKEY:" + rawHex + "\"" +
+                       "}";
+
+  int httpCode = http.POST(jsonPayload);
+  String response = http.getString();
+
+  if (httpCode == HTTP_CODE_OK) {
+    Serial.printf("HTTP %d - Response: %s\n", httpCode, response.c_str());
+    if (response.indexOf("OK:") >= 0) {
+      Serial.println("\u2713 Server accepted data");
+      http.end();
+      return true;
+    } else {
+      Serial.println("\u2717 Server rejected data");
+    }
+  } else {
+    Serial.printf("HTTP POST failed - Code: %d\n", httpCode);
+  }
+
+  http.end();
+  return false;
 }
 
 static bool http_post_enc_data(const std::vector<uint8_t>& packet) {
@@ -345,20 +413,24 @@ static bool generate_and_encrypt_master_key() {
   hexPrint("Generated master key", gMasterKey, 32);
   printEntropySummary(&er);
   
-  Serial.println("Using original unreduced master key (no mod NTRU_P reduction)");
-  
-  // Store original master key in NVS (no reduction)
-  if (!store_master_key_nvs(gMasterKey, 32)) {
+  // Reduce master key to match NTRU byte<->poly mapping on server (byte % NTRU_P)
+  uint8_t reducedKey[32];
+  for (int i = 0; i < 32; ++i) reducedKey[i] = (uint8_t)(gMasterKey[i] % 3);
+  Serial.println("Using reduced master key (byte % 3) to match NTRU mapping");
+
+  // Store reduced master key in NVS
+  if (!store_master_key_nvs(reducedKey, 32)) {
     Serial.println("✗ Failed to store master key in NVS");
     memset(gMasterKey, 0, 32);
+    memset(reducedKey, 0, 32);
     return false;
   }
   
-  // Encrypt with NTRU using the SAME original key that we stored
+  // Encrypt with NTRU using the SAME reduced key that we stored
   NTRU ntru;
   Poly m, e, h;
   
-  NTRU::bytes_to_poly(std::vector<uint8_t>(gMasterKey, gMasterKey + 32), m, 32);
+  NTRU::bytes_to_poly(std::vector<uint8_t>(reducedKey, reducedKey + 32), m, 32);
   
   if (gPublicKey.empty() || gPublicKey.size() != NTRU_N * 2) {
     Serial.println("✗ Invalid public key");
@@ -381,13 +453,14 @@ static bool generate_and_encrypt_master_key() {
   
   hexPrint("NTRU encrypted master key", encryptedKey.data(), encryptedKey.size());
   
-  Serial.printf("Encrypting the same original key that was stored in NVS (no reduction)\n");
+  Serial.printf("Encrypting the same reduced key that was stored in NVS\n");
   
   // Send to server
-  bool success = http_post_enc_key(encryptedKey);
+  bool success = http_post_enc_key_with_raw(encryptedKey, reducedKey);
   
   // Clear sensitive data
   memset(gMasterKey, 0, 32);
+  memset(reducedKey, 0, 32);
   
   return success;
 }
@@ -524,6 +597,17 @@ static void pipelineEncryptPacket(const DerivedKeys& baseKeys,
     packet.clear();
     return;
   }
+  // Log per-message keys (first 4 bytes for compactness)
+  {
+    char tnk[9], trk[9];
+    for (int i = 0; i < 4; ++i) {
+      sprintf(&tnk[i * 2], "%02X", mk.tinkerbellKey[i]);
+      sprintf(&trk[i * 2], "%02X", mk.transpositionKey[i]);
+    }
+    tnk[8] = '\0';
+    trk[8] = '\0';
+    Serial.printf("[ESP32] MsgKeys: lfsrSeed=0x%08X tnk[0..3]=%s trn[0..3]=%s\n", mk.lfsrSeed, tnk, trk);
+  }
 
   // First add salt to the plain data
   std::vector<uint8_t> saltedData = insertSalt(data, dataLen, 
@@ -544,14 +628,16 @@ static void pipelineEncryptPacket(const DerivedKeys& baseKeys,
 
   // Tinkerbell mixing
   {
-    Tinkerbell tk(mk.tinkerbellKey);
-    tk.xorBitwise(buf.data(), buf.size());
+    // Use deterministic HMAC-based stream XOR keyed by mk.tinkerbellKey and nonce
+    xor_with_stream_hmac(mk.tinkerbellKey, nonce, buf.data(), buf.size());
     if (verbose) hexPrint("After Tinkerbell", buf.data(), buf.size());
   }
 
-  // Transposition
+  // Transposition (pass only first 8 bytes of the 16-byte key)
   {
-    applyTransposition(buf.data(), grid, mk.transpositionKey, PermuteMode::Forward);
+    uint8_t trKey8[8];
+    memcpy(trKey8, mk.transpositionKey, 8);
+    applyTransposition(buf.data(), grid, trKey8, PermuteMode::Forward);
     if (verbose) hexPrint("After Transposition", buf.data(), buf.size());
   }
   if (verbose) hexPrint("After Encryption (with salt)", buf.data(), buf.size());
@@ -721,6 +807,11 @@ void handle_communication_state() {
     
     case STATE_SEND_HEALTH_DATA: {
       printStatus("SEND_HEALTH_DATA");
+      if (healthSendCount >= MAX_PACKETS) {
+        Serial.println("Reached MAX_PACKETS limit; pausing transmissions");
+        delay(2000);
+        break;
+      }
       if (millis() - lastHealthSend >= HEALTH_DATA_INTERVAL_MS) {
         if (encrypt_and_send_health_data()) {
           retryCount = 0;
@@ -771,7 +862,7 @@ static bool derive_symmetric_keys() {
     return false;
   }
   
-  hexPrint("Loaded master key from NVS", masterKey, 32);
+  hexPrint("Loaded (reduced) master key from NVS", masterKey, 32);
   
   if (!deriveKeys(masterKey, 32, gBaseKeys)) {
     Serial.println("Failed to derive symmetric keys");

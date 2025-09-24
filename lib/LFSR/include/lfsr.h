@@ -1,7 +1,8 @@
 #pragma once
 #include <stdint.h>
 #include <stddef.h>
-#include "tinkerbell.h" // uses your Tinkerbell class
+#include <stddef.h>
+#include <stdint.h>
 
 
 // 16-bit LFSR (kept for compatibility)
@@ -39,23 +40,10 @@ private:
  */
 class ChaoticLFSR32 {
 public:
-    // chaosKey16: 16 bytes used to seed internal Tinkerbell for tap masks.
-    ChaoticLFSR32(uint32_t seed, const uint8_t chaosKey16[16], uint32_t initialTap = 0xA3000001u)
-      : state_(seed ? seed : 0xACE1u), taps_(initialTap ? initialTap : 0xA3000001u), byteCounter_(0)
-    {
-        // Derive a separate key for the internal tap-generator so it is independent
-        // from the external Tinkerbell used for XOR in the pipeline.
-        // Simple deterministic tweak: XOR each byte with 0x5A (or use a real KDF).
-        uint8_t localKey[16];
-        for (int i = 0; i < 16; ++i) localKey[i] = (chaosKey16 ? chaosKey16[i] ^ 0x5Au : (uint8_t)(i * 31 + 7));
-        chaosTap_ = new Tinkerbell(localKey);
-        // optional burn-in to decorrelate: match same number on encrypt/decrypt
-        for (int i = 0; i < 32; ++i) (void)chaosTap_->nextByte();
-    }
+    // chaosKey16: 16 bytes used to seed deterministic tap-mask stream (platform-stable)
+    ChaoticLFSR32(uint32_t seed, const uint8_t chaosKey16[16], uint32_t initialTap = 0xA3000001u);
 
-    ~ChaoticLFSR32() {
-        if (chaosTap_) { delete chaosTap_; chaosTap_ = nullptr; }
-    }
+    ~ChaoticLFSR32() {}
 
     // reseed without touching chaosTap_ (chaosTap_ seeded on construction)
     void reseed(uint32_t seed) {
@@ -84,22 +72,16 @@ private:
     uint32_t state_;
     uint32_t taps_;
     uint64_t byteCounter_;
-    Tinkerbell *chaosTap_;
+    // HMAC-based deterministic keystream state
+    uint8_t key16_[16];
+    uint32_t seedBe_;
+    uint8_t block_[32];
+    size_t blockIndex_;
+    uint32_t blockCounter_;
 
     // produce a 32-bit tap mask from the internal tap-chaos generator
-    uint32_t generateTapMaskFromChaos() {
-        // deterministic: read 4 bytes from chaosTap_ and combine
-        uint32_t m = 0;
-        for (int i = 0; i < 4; ++i) {
-            uint8_t b = chaosTap_->nextByte(); // consumes exactly 4 bytes per mask
-            m = (m << 8) | b;
-        }
-        // ensure at least bit 0 is set (LSB) so parity feedback defined
-        m |= 1u;
-        // optional: force a few known taps to ensure maximal properties (if desired)
-        byteCounter_++;
-        return m;
-    }
+    uint8_t nextKeystreamByte();
+    uint32_t generateTapMaskFromChaos();
 
     // internal nextByte that uses current taps_
     uint8_t nextByte_internal() {

@@ -79,3 +79,23 @@ void NTRU::poly_to_bytes(const Poly& poly, std::vector<uint8_t>& bytes, size_t l
         bytes[i] = static_cast<uint8_t>(poly.coeffs[i] & 0xFF);
     }
 }
+
+// Map 2 bytes per coefficient (big-endian) into poly, up to NTRU_N
+void NTRU::bytes_to_poly16(const std::vector<uint8_t>& bytes, Poly& poly) {
+    std::fill(poly.coeffs.begin(), poly.coeffs.end(), 0);
+    size_t count = std::min(bytes.size() / 2, (size_t)NTRU_N);
+    for (size_t i = 0; i < count; ++i) {
+        uint16_t v = (static_cast<uint16_t>(bytes[2*i]) << 8) | bytes[2*i + 1];
+        poly.coeffs[i] = static_cast<int16_t>(v % NTRU_Q);
+    }
+}
+
+// Serialize each coefficient as 2 bytes (big-endian), length 2*NTRU_N
+void NTRU::poly_to_bytes16(const Poly& poly, std::vector<uint8_t>& bytes) {
+    bytes.resize(NTRU_N * 2);
+    for (int i = 0; i < NTRU_N; ++i) {
+        uint16_t v = static_cast<uint16_t>(poly.coeffs[i] & 0xFFFF);
+        bytes[2*i]     = static_cast<uint8_t>((v >> 8) & 0xFF);
+        bytes[2*i + 1] = static_cast<uint8_t>(v & 0xFF);
+    }
+}
